@@ -2,11 +2,37 @@ import { open, mkdir, readdir, unlink, chmod } from "node:fs/promises";
 import path from "node:path";
 import { scanJsonReplacer } from "./events.js";
 import type { DecodedEvent } from "./decode.js";
+import {
+  DEFAULT_JSONL_CHUNK_BYTES,
+  DEFAULT_MAX_JSONL_LINE_BYTES,
+  JsonlLineTooLongError,
+  parseJsonlStream,
+} from "./scan-jsonl.js";
+
+export {
+  DEFAULT_JSONL_CHUNK_BYTES,
+  DEFAULT_MAX_JSONL_LINE_BYTES,
+  JsonlLineTooLongError,
+};
 
 export interface EventArchiveOptions {
   dir: string;
   maxBytes?: number;
   maxFiles?: number;
+}
+
+export interface ReadArchiveOptions {
+  /**
+   * Maximum allowed byte length of a single JSONL record (excluding line ending).
+   * Oversized records are rejected before UTF-8 decoding or `JSON.parse`.
+   * Defaults to {@link DEFAULT_MAX_JSONL_LINE_BYTES} (64 KiB).
+   */
+  maxLineBytes?: number;
+  /**
+   * Fixed read buffer size in bytes for streaming each archive file.
+   * Defaults to {@link DEFAULT_JSONL_CHUNK_BYTES} (64 KiB).
+   */
+  chunkBytes?: number;
 }
 
 export interface EventArchive {
@@ -137,22 +163,60 @@ async function listArchiveFiles(dir: string): Promise<string[]> {
   }
 }
 
-export async function* readArchive(dir: string): AsyncGenerator<DecodedEvent, void, unknown> {
+function validateChunkBytes(chunkBytes: number): number {
+  if (!Number.isFinite(chunkBytes) || !Number.isInteger(chunkBytes) || chunkBytes < 1) {
+    throw new RangeError("chunkBytes must be a positive finite integer");
+  }
+  return chunkBytes;
+}
+
+async function* readFileChunks(
+  filePath: string,
+  chunkBytes: number,
+): AsyncGenerator<Buffer, void, unknown> {
+  const handle = await open(filePath, "r");
+  try {
+    const buffer = Buffer.allocUnsafe(chunkBytes);
+    for (;;) {
+      const { bytesRead } = await handle.read(buffer, 0, chunkBytes, null);
+      if (bytesRead === 0) break;
+      yield buffer.subarray(0, bytesRead);
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Stream decoded events from a single JSONL archive file using a fixed-size
+ * read buffer and a bounded line buffer. Oversized records are rejected with
+ * {@link JsonlLineTooLongError} before parsing.
+ */
+export async function* readArchiveFile(
+  filePath: string,
+  options: ReadArchiveOptions = {},
+): AsyncGenerator<DecodedEvent, void, unknown> {
+  const chunkBytes = validateChunkBytes(options.chunkBytes ?? DEFAULT_JSONL_CHUNK_BYTES);
+  const maxLineBytes = options.maxLineBytes ?? DEFAULT_MAX_JSONL_LINE_BYTES;
+  const source = path.basename(filePath);
+
+  yield* parseJsonlStream<DecodedEvent>(readFileChunks(filePath, chunkBytes), {
+    maxLineBytes,
+    source,
+  });
+}
+
+/**
+ * Stream decoded events across all rotating JSONL archive files in `dir` in
+ * chronological filename order, using a bounded line buffer so memory stays
+ * independent of total archive size.
+ */
+export async function* readArchive(
+  dir: string,
+  options: ReadArchiveOptions = {},
+): AsyncGenerator<DecodedEvent, void, unknown> {
   const files = await listArchiveFiles(dir);
   for (const file of files) {
-    const filePath = path.join(dir, file);
-    const handle = await open(filePath, "r");
-    try {
-      const content = await handle.readFile({ encoding: "utf8" });
-      const lines = content.split("\n");
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        const parsed = JSON.parse(trimmed);
-        yield parsed as DecodedEvent;
-      }
-    } finally {
-      await handle.close();
-    }
+    yield* readArchiveFile(path.join(dir, file), options);
   }
 }
