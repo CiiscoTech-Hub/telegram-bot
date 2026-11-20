@@ -1,6 +1,6 @@
 import { escapeMd } from "../notifications/format.js";
 import type { BotConfig } from "../config.js";
-import { helpMessage } from "../bot.js";
+import { helpMessage } from "./help.js";
 
 export interface CommandDetail {
   usage: string;
@@ -27,6 +27,14 @@ export const COMMAND_DETAILS: Record<string, CommandDetail> = {
     operatorOnly: false,
     description: "Show general help listing all commands, or detailed help with usage, arguments, and examples for a specific command.",
     examples: ["/help", "/help preview", "/help audit", "/help status"],
+  },
+  about: {
+    usage: "/about",
+    arguments: "None",
+    whoCanRun: "Anyone",
+    operatorOnly: false,
+    description: "Show the bot version, the Stellar network it watches, and where its source lives.",
+    examples: ["/about"],
   },
   status: {
     usage: "/status",
@@ -67,6 +75,14 @@ export const COMMAND_DETAILS: Record<string, CommandDetail> = {
     operatorOnly: false,
     description: "Preview Telegram channel notification formatting and verify link preview settings for market or squad contracts.",
     examples: ["/preview", "/preview market", "/preview squad"],
+  },
+  categories: {
+    usage: "/categories",
+    arguments: "None",
+    whoCanRun: "Anyone in allowed chats",
+    operatorOnly: false,
+    description: "Display observed claim categories and counts derived from seen events, marking any filtered out by configuration.",
+    examples: ["/categories"],
   },
   pause: {
     usage: "/pause",

@@ -40,6 +40,28 @@ export interface EventArchive {
   close(): Promise<void>;
 }
 
+export interface ReadArchiveOptions {
+  /** Yield valid records before a malformed record instead of discarding them. Defaults to false. */
+  retainCommitted?: boolean;
+}
+
+export class MalformedArchiveRecordError extends Error {
+  readonly fileName: string;
+  readonly lineNumber: number;
+
+  constructor(fileName: string, lineNumber: number) {
+    const safeFileName = path
+      .basename(fileName)
+      .replace(/[\x00-\x1f\x7f]/g, " ")
+      .slice(0, 128);
+    const displayedFileName = safeFileName || "<unknown>";
+    super(`Malformed archive record at ${displayedFileName}:${lineNumber}`);
+    this.name = "MalformedArchiveRecordError";
+    this.fileName = displayedFileName;
+    this.lineNumber = lineNumber;
+  }
+}
+
 const DEFAULT_MAX_BYTES = 10 * 1024 * 1024; // 10 MiB
 const DEFAULT_MAX_FILES = 10;
 const FILE_MODE = 0o600;
@@ -50,6 +72,11 @@ function formatArchiveFilename(index: number, timestamp: number): string {
   return `events-${ts}-${idx}.jsonl`;
 }
 
+/**
+ * Create an append-only event archive that writes the canonical JSONL export
+ * format: UTF-8 encoded, one JSON record per line, delimited by LF (`\n`)
+ * regardless of host operating system.
+ */
 export function createEventArchive(options: EventArchiveOptions): EventArchive {
   const { dir } = options;
   const maxBytes = Math.max(1, options.maxBytes ?? DEFAULT_MAX_BYTES);
@@ -163,60 +190,48 @@ async function listArchiveFiles(dir: string): Promise<string[]> {
   }
 }
 
-function validateChunkBytes(chunkBytes: number): number {
-  if (!Number.isFinite(chunkBytes) || !Number.isInteger(chunkBytes) || chunkBytes < 1) {
-    throw new RangeError("chunkBytes must be a positive finite integer");
-  }
-  return chunkBytes;
-}
-
-async function* readFileChunks(
-  filePath: string,
-  chunkBytes: number,
-): AsyncGenerator<Buffer, void, unknown> {
-  const handle = await open(filePath, "r");
-  try {
-    const buffer = Buffer.allocUnsafe(chunkBytes);
-    for (;;) {
-      const { bytesRead } = await handle.read(buffer, 0, chunkBytes, null);
-      if (bytesRead === 0) break;
-      yield buffer.subarray(0, bytesRead);
-    }
-  } finally {
-    await handle.close();
-  }
-}
-
 /**
- * Stream decoded events from a single JSONL archive file using a fixed-size
- * read buffer and a bounded line buffer. Oversized records are rejected with
- * {@link JsonlLineTooLongError} before parsing.
- */
-export async function* readArchiveFile(
-  filePath: string,
-  options: ReadArchiveOptions = {},
-): AsyncGenerator<DecodedEvent, void, unknown> {
-  const chunkBytes = validateChunkBytes(options.chunkBytes ?? DEFAULT_JSONL_CHUNK_BYTES);
-  const maxLineBytes = options.maxLineBytes ?? DEFAULT_MAX_JSONL_LINE_BYTES;
-  const source = path.basename(filePath);
-
-  yield* parseJsonlStream<DecodedEvent>(readFileChunks(filePath, chunkBytes), {
-    maxLineBytes,
-    source,
-  });
-}
-
-/**
- * Stream decoded events across all rotating JSONL archive files in `dir` in
- * chronological filename order, using a bounded line buffer so memory stays
- * independent of total archive size.
+ * Read decoded events from an archive directory in chronological file order.
+ * Accepts both LF (`\n`) and CRLF (`\r\n`) line endings without altering record
+ * identities, skipping blank lines.
  */
 export async function* readArchive(
   dir: string,
   options: ReadArchiveOptions = {},
 ): AsyncGenerator<DecodedEvent, void, unknown> {
   const files = await listArchiveFiles(dir);
+  const stagedEvents: DecodedEvent[] = [];
+  const retainCommitted = options.retainCommitted === true;
+
   for (const file of files) {
-    yield* readArchiveFile(path.join(dir, file), options);
+    const filePath = path.join(dir, file);
+    const handle = await open(filePath, "r");
+    try {
+      const content = await handle.readFile({ encoding: "utf8" });
+      const lines = content.split(/\r?\n/);
+      for (let index = 0; index < lines.length; index += 1) {
+        const line = lines[index]!;
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        let parsed: DecodedEvent;
+        try {
+          parsed = JSON.parse(trimmed) as DecodedEvent;
+        } catch {
+          throw new MalformedArchiveRecordError(file, index + 1);
+        }
+
+        if (retainCommitted) {
+          yield parsed;
+        } else {
+          stagedEvents.push(parsed);
+        }
+      }
+    } finally {
+      await handle.close();
+    }
+  }
+
+  for (const event of stagedEvents) {
+    yield event;
   }
 }

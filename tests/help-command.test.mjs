@@ -10,15 +10,17 @@ const INTRO = "*Mimir notifier*\n\nI watch Mimir's two Soroban contracts on Stel
 const PUBLIC_LINES = [
   "/start — What this bot does",
   "/help — Show help",
+  "/about — About this bot",
   "/status — Last\\-seen ledger and watched contracts",
   "/contracts — Contract ids and explorer links",
   "/health — Health assessment and operational readiness",
   "/preview — Preview channel notification formatting",
+  "/categories — Observed claim categories and counts",
 ];
 const ALL_LINES = [
-  ...PUBLIC_LINES.slice(0, 3),
+  ...PUBLIC_LINES.slice(0, 4),
   "/audit — Operator only: audit report \\(redacted, bounded\\)",
-  ...PUBLIC_LINES.slice(3),
+  ...PUBLIC_LINES.slice(4),
   "/pause — Operator only: pause new scans",
   "/resume — Operator only: resume polling now",
 ];
@@ -52,7 +54,7 @@ for (const operatorId of [null, "42"]) {
       assert.ok(handlers.has(command), `${command} has a handler`);
       assert.ok(description.length >= 1 && description.length <= 256);
     }
-    assert.equal(handlers.size, 9, "disabled operator handlers still enforce authorization");
+    assert.equal(handlers.size, 12, "disabled operator handlers still enforce authorization");
   });
 }
 

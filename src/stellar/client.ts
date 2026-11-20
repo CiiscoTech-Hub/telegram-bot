@@ -41,6 +41,32 @@ export function createRpcServer(config: StellarConfig): rpc.Server {
 /** Default stellar.expert origin; override with STELLAR_EXPLORER_BASE_URL. */
 export const DEFAULT_EXPLORER_BASE_URL = "https://stellar.expert/explorer";
 
+/** Default authoritative ceiling (ms) for RPC retry / backoff delays. */
+export const DEFAULT_RPC_MAX_BACKOFF_MS = 60_000;
+
+/**
+ * Resolve the authoritative maximum RPC backoff in milliseconds.
+ *
+ * Returns {@link DEFAULT_RPC_MAX_BACKOFF_MS} when `configuredMaxBackoffMs` is
+ * omitted; throws a bounded `RangeError` if a configured value is negative,
+ * non-finite, or not a number so a bad config cannot disable the cap.
+ */
+export function resolveMaxBackoffMs(configuredMaxBackoffMs?: number): number {
+  if (configuredMaxBackoffMs === undefined) {
+    return DEFAULT_RPC_MAX_BACKOFF_MS;
+  }
+  if (
+    typeof configuredMaxBackoffMs !== "number" ||
+    !Number.isFinite(configuredMaxBackoffMs) ||
+    configuredMaxBackoffMs < 0
+  ) {
+    throw new RangeError(
+      `maxBackoffMs must be a finite non-negative number; got ${typeof configuredMaxBackoffMs}`,
+    );
+  }
+  return configuredMaxBackoffMs;
+}
+
 /**
  * Resolve the explorer network path segment from the configured network name.
  * `futurenet` and `custom` fall back to `testnet` so links remain usable in
@@ -258,6 +284,10 @@ function truncatedContractId(contractId: string): string {
  * not a string, rather than letting it reach the RPC or corrupt the filter.
  * Used at the boundary where contract IDs enter RPC requests.
  *
+ * Covered by `tests/client-validation-fuzz.test.mjs`, which fuzzes this
+ * validator with a seeded generator to confirm every malformed input throws
+ * a {@link ContractIdError} (never an unexpected error type).
+ *
  * @param contractId - The contract ID to validate (typically from config)
  * @param field - Label used in error messages, e.g. "market contract ID"
  * @throws {ContractIdError} When the contract ID is invalid
@@ -302,6 +332,10 @@ function boundedLedgerValue(value: unknown): string {
  * Throws a bounded {@link LedgerWindowError} when the numbers are missing,
  * negative, non-integer, or inverted, rather than letting a nonsense range
  * reach the RPC.
+ *
+ * Covered by `tests/client-validation-fuzz.test.mjs`, which fuzzes this
+ * validator with a seeded generator (including negatives and `NaN`) to
+ * confirm every malformed window throws a {@link LedgerWindowError}.
  */
 export function validateLedgerWindow(health: {
   oldestLedger?: unknown;

@@ -14,6 +14,7 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 ### Telegram Settings
 - `BOT_TOKEN`: The API token for the Telegram bot. Required.
 - `TELEGRAM_CHAT_ID`: The numeric ID or `@channelusername` where notifications are posted. Required.
+- `MIMIR_LOCALE`: Language for bot replies and notifications. Supported: `en` (default) and `es`; region tags such as `es-MX` resolve to the base language. Any other value fails fast at startup. See [Translator Guide](translating.md).
 
 ### Mimir Contract Settings
 - `MARKET_CONTRACT_ID`: The Mimir market Soroban contract address. Required. Must be a valid `C...` strkey.
@@ -32,12 +33,14 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 
 ### Notification Filtering
 - `NOTIFY_ENABLED`, `NOTIFY_MARKET`, `NOTIFY_SQUAD`: Coarse boolean kill switches for global or per-contract notifications (all default to `true`).
+- `SILENT_EVENTS`: Comma-separated event names sent without sound. Defaults to deposits, withdrawals, and fee claims; unknown names fail configuration validation.
 - `NOTIFY_CATEGORIES` (along with aliases `NOTIFICATION_CATEGORIES`, `NOTIFY_EVENT_CATEGORIES`, `EVENT_CATEGORIES`, and `CLAIM_CATEGORIES`): Optional allowlist restricting `mimir-market` `claim_created` notifications by category.
 - For full details on defaults, evaluation precedence, and worked examples, see [Notification Filters](notification-filters.md).
 
 ### Health Reporting
 - `HEALTH_HOST` & `HEALTH_PORT`: Binds a local HTTP endpoint for health probes (e.g., Kubernetes liveness probes). Set port to 0 to disable.
 - `HEALTH_STALE_MS`: Marks the health endpoint as degraded if no successful poll completes within this window (e.g., 90000ms).
+- `HEALTH_AUTH_TOKEN`: Optional bearer token for all health/metrics routes. Authorization headers over 4096 UTF-8 bytes (including `Bearer `) are rejected with the same empty `401` as other malformed values.
 
 ## Operational Behavior
 

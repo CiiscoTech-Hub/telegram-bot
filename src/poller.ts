@@ -52,14 +52,25 @@
  * the only resume token, in the same `version: 1` format as before.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { copyFile, mkdir, readFile, rename, writeFile, unlink } from "node:fs/promises";
 import path from "node:path";
 
 import type { rpc } from "@stellar/stellar-sdk";
 
+import {
+  ActivityBaseline,
+  type ActivityBaselineOptions,
+  type ActivityBaselineSnapshot,
+} from "./activity-baseline.js";
 import type { Metrics } from "./metrics.js";
+import {
+  NotificationAge,
+  type NotificationAgeSummary,
+  type NotificationIngestionMark,
+} from "./stellar/metrics.js";
 import type { SendExtra } from "./bot.js";
+import { createCategoryCounter } from "./commands/categories.js";
 import { appendAuditFile, auditEntry, createAuditLog, type AuditLog } from "./audit.js";
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, type BotConfig } from "./config.js";
 import { EventDedupWindow } from "./dedup.js";
@@ -69,6 +80,10 @@ import {
   DEAD_LETTER_MAX_ENTRIES,
   type DeadLetterStats,
 } from "./deadLetter.js";
+import {
+  createSendJournal,
+  type SendJournal,
+} from "./notifications/send-journal.js";
 import {
   acquireInstanceLock,
   InstanceLockError,
@@ -86,6 +101,7 @@ import { Logger } from "./logger.js";
 import { isNotificationAllowed } from "./notifications/featureFlags.js";
 import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./status.js";
 import { validateLedgerWindow, type LedgerWindow } from "./stellar/client.js";
+import { parseRetryAfterHeaderMs } from "./stellar/rpc-guard.js";
 import { LedgerCache } from "./stellar/ledger-cache.js";
 import {
   eventCursorLedger,
@@ -174,8 +190,82 @@ export interface RestartGap {
   missedLedgers: number;
 }
 
+/**
+ * Format an unrecoverable restart gap alert for the operator as plain text.
+ */
+export function formatRestartGapAlert(gap: {
+  source: ContractSource;
+  cursorLedger: number;
+  oldestLedger: number;
+}): string {
+  return (
+    `[Restart Gap Alert] Unrecoverable restart gap detected for ${gap.source}.\n` +
+    `Missed ledger range: ${gap.cursorLedger} to ${gap.oldestLedger}.\n` +
+    `Suggested replay command: npm run replay -- --from ${gap.oldestLedger} --contract ${gap.source} --send`
+  );
+}
+
 export type PollerPauseResult = "paused" | "already-paused" | "stopped";
 export type PollerResumeResult = "resumed" | "already-running" | "stopped";
+
+export interface PollerCounters {
+  cycles: number;
+  notificationsSent: number;
+  notificationsFailed: number;
+  eventsSkipped: number;
+}
+
+/**
+ * Per-target summary fields included in the structured `cycle_summary` log entry.
+ *
+ * Stable field names (documented for log consumers and alerts):
+ * - `source`: `"market" | "squad"` — contract target identifier
+ * - `fetched`: number of events returned by the RPC scan for this target in the cycle
+ * - `decoded`: number of fetched events with a known decoded payload (`payload.name !== "unknown"`)
+ * - `sent`: number of notifications delivered to Telegram for this target in the cycle
+ * - `skipped`: number of events skipped for this target in the cycle
+ * - `cursorLedger`: ledger number parsed from the target's cursor at the end of the cycle
+ *   (`null` when no cursor is held or the cursor is opaque; never the raw cursor string)
+ */
+export interface CycleTargetSummary {
+  source: ContractSource;
+  fetched: number;
+  decoded: number;
+  sent: number;
+  skipped: number;
+  cursorLedger: number | null;
+}
+
+/**
+ * Structured JSON fields emitted by `Logger.info("poller", ...)` at the end of each poll cycle.
+ *
+ * Stable field names (documented for log consumers and alerts):
+ * - `action`: always `"cycle_summary"`
+ * - `cycle`: 1-based poll cycle number (`PollerStatus.cycles`)
+ * - `durationMs`: elapsed duration of the cycle in milliseconds
+ * - `targets`: per-target summary keyed by `ContractSource` (`market`, `squad`)
+ * - `suppressed`: number of idle-cycle summary lines suppressed in the previous `LogSampler` window
+ */
+export interface CycleSummaryFields {
+  action: "cycle_summary";
+  cycle: number;
+  durationMs: number;
+  targets: Record<ContractSource, CycleTargetSummary>;
+  suppressed: number;
+}
+
+/** Current on-disk counters schema version. */
+export const COUNTERS_SCHEMA_VERSION = 1 as const;
+
+export interface CountersFile {
+  version: typeof COUNTERS_SCHEMA_VERSION;
+  updatedAt: string;
+  contracts: {
+    marketContractId: string;
+    squadContractId: string;
+  };
+  counters: PollerCounters;
+}
 
 export interface PollerStatus {
   running: boolean;
@@ -209,12 +299,24 @@ export interface PollerStatus {
   oldestLedger: number | null;
   notificationsSent: number;
   notificationsFailed: number;
+  /** End-to-end notification age (ledger close -> confirmed send) summary. */
+  notificationAge?: NotificationAgeSummary;
   /** Never attempted (unknown, malformed or over the per-cycle cap). */
   eventsSkipped: number;
+  /** Counter values accumulated since this process started. */
+  sinceStart?: PollerCounters;
+  /** Cumulative counter values persisted across restarts for the current contract IDs. */
+  cumulative?: PollerCounters;
   /** Cumulative empty getEvents pages across all successful target scans. */
   emptyPages: number;
   /** Cumulative pages walked across all successful target scans. */
   pagesScanned: number;
+  /**
+   * Rolling comparison of this cycle's event count against recent complete
+   * cycles. Updated only when every target was scanned, so a partial cycle is
+   * never mistaken for a quiet chain.
+   */
+  activityBaseline?: ActivityBaselineSnapshot;
   /** Empty pages in the most recent completed cycle (all targets). */
   lastCycleEmptyPages: number;
   /** Pages walked in the most recent completed cycle (all targets). */
@@ -259,6 +361,8 @@ export interface PollerStatus {
   persistentVolumeAvailable?: boolean;
   persistentVolumeError?: string | null;
   targets: TargetState[];
+  /** Bounded category counts derived from observed claim_created events. */
+  categories?: Record<string, number>;
   /** SHA-256 digest of the SBOM generated for this deployment image. */
   sbomDigest: string | null;
   /** RPC circuit breaker state */
@@ -273,6 +377,33 @@ export interface PollerStatus {
 /** Current on-disk cursor schema. Bump when the shape of `targets` changes. */
 export const CURSOR_SCHEMA_VERSION = 1 as const;
 
+/** Maximum number of cursor recovery records retained in the cursor file. */
+export const MAX_CURSOR_RECOVERY_HISTORY = 20 as const;
+
+/** Bounded set of reasons a cursor recovery record can carry. */
+export type CursorRecoveryReason = "floor_rewind" | "restore" | "quarantine";
+
+/** Minimal cursor position snapshot (never includes event IDs, payloads, or secrets). */
+export interface CursorRecoveryPosition {
+  cursor: string | null;
+  lastEventLedger: number | null;
+  rewindFromLedger?: number | null;
+}
+
+/** One bounded recovery history record persisted in the cursor file. */
+export interface CursorRecoveryRecord {
+  /** ISO-8601 UTC timestamp of when the recovery occurred. */
+  at: string;
+  /** Bounded recovery reason. */
+  reason: CursorRecoveryReason;
+  /** Target source when a single target was recovered (e.g. floor_rewind). */
+  source?: string;
+  /** Target positions before recovery. */
+  before: Record<string, CursorRecoveryPosition>;
+  /** Target positions after recovery. */
+  after: Record<string, CursorRecoveryPosition>;
+}
+
 export interface CursorFile {
   version: typeof CURSOR_SCHEMA_VERSION;
   updatedAt: string;
@@ -283,6 +414,13 @@ export interface CursorFile {
    */
   chainClockAt?: number | null;
   targets: Record<string, CursorTarget>;
+  /**
+   * Bounded history of cursor recovery actions (floor rewinds, operator
+   * restores, and corrupt-file quarantines), oldest first. Optional and
+   * additive: files written before this field existed load with an empty
+   * history, and older builds ignore it.
+   */
+  recoveryHistory?: CursorRecoveryRecord[];
 }
 
 interface CursorTarget {
@@ -363,6 +501,145 @@ function parseRewindFromLedger(value: unknown): number | null {
   return value;
 }
 
+const VALID_RECOVERY_REASONS = new Set<CursorRecoveryReason>([
+  "floor_rewind",
+  "restore",
+  "quarantine",
+]);
+
+function parseRecoveryPosition(value: unknown): CursorRecoveryPosition | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const obj = value as Record<string, unknown>;
+
+  let cursor: string | null = null;
+  if (obj.cursor === null || obj.cursor === undefined) {
+    cursor = null;
+  } else if (typeof obj.cursor === "string") {
+    if (obj.cursor.length > 256) return null;
+    cursor = obj.cursor.length > 0 ? obj.cursor : null;
+  } else {
+    return null;
+  }
+
+  let lastEventLedger: number | null = null;
+  if (obj.lastEventLedger === null || obj.lastEventLedger === undefined) {
+    lastEventLedger = null;
+  } else if (
+    typeof obj.lastEventLedger === "number" &&
+    Number.isSafeInteger(obj.lastEventLedger) &&
+    obj.lastEventLedger >= 0
+  ) {
+    lastEventLedger = obj.lastEventLedger;
+  } else {
+    return null;
+  }
+
+  const rewindFromLedger = parseRewindFromLedger(obj.rewindFromLedger);
+  return {
+    cursor,
+    lastEventLedger,
+    ...(rewindFromLedger !== null ? { rewindFromLedger } : {}),
+  };
+}
+
+function parseRecoveryPositionMap(value: unknown): Record<string, CursorRecoveryPosition> | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const out: Record<string, CursorRecoveryPosition> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (key.length === 0 || key.length > 64) return null;
+    const pos = parseRecoveryPosition(entry);
+    if (pos === null) return null;
+    out[key] = pos;
+  }
+  return out;
+}
+
+function sanitizeRecoveryRecord(value: unknown): CursorRecoveryRecord | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const obj = value as Record<string, unknown>;
+  if (
+    typeof obj.at !== "string" ||
+    obj.at.length === 0 ||
+    obj.at.length > 64 ||
+    Number.isNaN(Date.parse(obj.at))
+  ) {
+    return null;
+  }
+  if (typeof obj.reason !== "string" || !VALID_RECOVERY_REASONS.has(obj.reason as CursorRecoveryReason)) {
+    return null;
+  }
+  if (obj.source !== undefined && (typeof obj.source !== "string" || obj.source.length === 0 || obj.source.length > 64)) {
+    return null;
+  }
+  const before = parseRecoveryPositionMap(obj.before);
+  const after = parseRecoveryPositionMap(obj.after);
+  if (before === null || after === null) return null;
+
+  return {
+    at: obj.at,
+    reason: obj.reason as CursorRecoveryReason,
+    ...(typeof obj.source === "string" ? { source: obj.source } : {}),
+    before,
+    after,
+  };
+}
+
+/**
+ * Parse and bound a persisted `recoveryHistory` array. Malformed entries are
+ * dropped rather than failing cursor load — recovery metadata must never cost
+ * an operator their resume position — and any unknown fields (such as event
+ * payloads or secrets) are stripped.
+ */
+export function parseRecoveryHistory(
+  value: unknown,
+  maxEntries: number = MAX_CURSOR_RECOVERY_HISTORY,
+): CursorRecoveryRecord[] {
+  if (!Array.isArray(value) || maxEntries <= 0) return [];
+  const valid: CursorRecoveryRecord[] = [];
+  for (const item of value) {
+    const clean = sanitizeRecoveryRecord(item);
+    if (clean !== null) valid.push(clean);
+  }
+  return valid.length > maxEntries ? valid.slice(-maxEntries) : valid;
+}
+
+/**
+ * Snapshot only the position metadata (cursor, lastEventLedger, optional
+ * rewindFromLedger) for a map of targets, excluding event IDs, payloads, and
+ * secrets.
+ */
+export function snapshotCursorPositions(
+  targets: Record<string, Pick<CursorTarget, "cursor" | "lastEventLedger" | "rewindFromLedger">>,
+): Record<string, CursorRecoveryPosition> {
+  const out: Record<string, CursorRecoveryPosition> = {};
+  for (const [source, target] of Object.entries(targets)) {
+    out[source] = {
+      cursor: target.cursor ?? null,
+      lastEventLedger: target.lastEventLedger ?? null,
+      ...(typeof target.rewindFromLedger === "number"
+        ? { rewindFromLedger: target.rewindFromLedger }
+        : {}),
+    };
+  }
+  return out;
+}
+
+/**
+ * Append a recovery record to an existing history, sanitizing all fields and
+ * retaining at most `maxEntries` most-recent records.
+ */
+export function appendCursorRecoveryHistory(
+  history: readonly CursorRecoveryRecord[] | undefined,
+  record: CursorRecoveryRecord,
+  maxEntries: number = MAX_CURSOR_RECOVERY_HISTORY,
+): CursorRecoveryRecord[] {
+  const existing = parseRecoveryHistory(history ?? [], maxEntries);
+  const clean = sanitizeRecoveryRecord(record);
+  if (clean === null || maxEntries <= 0) return existing;
+  const combined = [...existing, clean];
+  return combined.length > maxEntries ? combined.slice(-maxEntries) : combined;
+}
+
 /** Tuning knobs for Telegram delivery; defaults suit production, tests shrink them. */
 export interface SendOptions {
   sendSpacingMs?: number;
@@ -418,6 +695,11 @@ export interface PollerDeps {
    */
   send: (text: string, source?: ContractSource, extra?: SendExtra) => Promise<void>;
   /**
+   * Optional direct notification hook for the operator (e.g. restart gaps).
+   * Plain-text message sent to the operator's private chat.
+   */
+  notifyOperator?: ((text: string) => Promise<void>) | undefined;
+  /**
    * Operator audit trail. A fresh one is created when omitted, so the poller
    * keeps working in callers that do not care about auditing (tests, tooling).
    */
@@ -432,8 +714,18 @@ export interface PollerDeps {
   targetBackoffOptions?: TargetBackoffOptions;
   /** Circuit breaker configuration */
   circuitBreakerOptions?: CircuitBreakerOptions;
+  /**
+   * Tuning for the rolling activity baseline. Defaults are production values;
+   * tests can shrink the window to observe a comparison quickly.
+   */
+  activityBaselineOptions?: ActivityBaselineOptions;
   /** Clock behind every timestamp this poller reports. Defaults to `Date.now`. */
   now?: () => number;
+  /**
+   * Monotonic clock (ms) used to measure in-process duration from event ingestion
+   * to confirmed send. Defaults to `() => performance.now()`.
+   */
+  monotonicNow?: () => number;
   /**
    * Async delay used for send-spacing and retry back-off.
    * Defaults to a real `setTimeout`-based sleep. Inject a no-op in tests to
@@ -520,34 +812,30 @@ const DEFAULT_MAX_BACKOFF_MS = 10_000;
 /** Maximum time to back off based on Retry-After (1 hour). */
 const MAX_RETRY_AFTER_MS = 60 * 60 * 1000;
 
-export function extractRetryAfterMs(err: unknown): number | null {
+export function extractRetryAfterMs(
+  err: unknown,
+  maxBackoffMs: number = MAX_RETRY_AFTER_MS,
+): number | null {
   if (!err || typeof err !== "object") return null;
   const e = err as any;
 
-  let seconds: number | null = null;
+  let rawRetryAfter: unknown = null;
 
   if (typeof e.parameters?.retry_after === "number") {
-    seconds = e.parameters.retry_after;
+    rawRetryAfter = e.parameters.retry_after;
   } else {
     const headers = e.response?.headers || e.headers;
     if (headers) {
-      let val: any;
       if (typeof headers.get === "function") {
-        val = headers.get("retry-after") || headers.get("Retry-After");
+        rawRetryAfter = headers.get("retry-after") || headers.get("Retry-After");
       } else {
-        val = headers["retry-after"] || headers["Retry-After"];
-      }
-      if (typeof val === "string" || typeof val === "number") {
-        const parsed = parseInt(String(val), 10);
-        if (!Number.isNaN(parsed)) seconds = parsed;
+        rawRetryAfter = headers["retry-after"] || headers["Retry-After"];
       }
     }
   }
 
-  if (seconds !== null && seconds > 0) {
-    return Math.min(seconds * 1000, MAX_RETRY_AFTER_MS);
-  }
-  return null;
+  const clamped = parseRetryAfterHeaderMs(rawRetryAfter, maxBackoffMs);
+  return clamped !== null && clamped > 0 ? clamped : null;
 }
 /**
  * Consecutive automatic floor rewinds allowed for one target before the poller
@@ -694,12 +982,18 @@ export function parseCursorFile(raw: string): CursorFile {
     };
   }
 
+  const recoveryHistory =
+    parsed.recoveryHistory !== undefined
+      ? parseRecoveryHistory(parsed.recoveryHistory)
+      : [];
+
   return {
     version: 1,
     updatedAt: parsed.updatedAt ?? "",
     // Additive field: only present when the file carried it.
     ...(parsed.chainClockAt !== undefined ? { chainClockAt: parseChainClock(parsed.chainClockAt) } : {}),
     targets,
+    ...(recoveryHistory.length > 0 ? { recoveryHistory } : {}),
   };
 }
 
@@ -844,6 +1138,10 @@ export function parseAndMigrateCursorFile(
         : nowIso;
     const file: CursorFile = { version: CURSOR_SCHEMA_VERSION, updatedAt, targets };
     if (parsed.chainClockAt !== undefined) file.chainClockAt = parseChainClock(parsed.chainClockAt);
+    if (parsed.recoveryHistory !== undefined) {
+      const recoveryHistory = parseRecoveryHistory(parsed.recoveryHistory);
+      if (recoveryHistory.length > 0) file.recoveryHistory = recoveryHistory;
+    }
     return {
       file,
       migrated: typeof parsed.updatedAt !== "string" || parsed.updatedAt.length === 0,
@@ -895,7 +1193,10 @@ export function buildCursorFile(
   }>,
   updatedAt: string,
   chainClockAt?: number | null,
+  recoveryHistory?: readonly CursorRecoveryRecord[],
 ): CursorFile {
+  const boundedHistory =
+    recoveryHistory !== undefined ? parseRecoveryHistory(recoveryHistory) : [];
   return {
     version: CURSOR_SCHEMA_VERSION,
     updatedAt,
@@ -915,6 +1216,98 @@ export function buildCursorFile(
         } satisfies CursorTarget,
       ]),
     ),
+    ...(boundedHistory.length > 0 ? { recoveryHistory: boundedHistory } : {}),
+  };
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * Strict schema check for persisted poller counters.
+ */
+export function isValidCountersFile(value: unknown): value is CountersFile {
+  if (!isPlainObject(value)) return false;
+  if (value.version !== COUNTERS_SCHEMA_VERSION) return false;
+  if (typeof value.updatedAt !== "string") return false;
+  if (!isPlainObject(value.contracts)) return false;
+  if (
+    typeof value.contracts.marketContractId !== "string" ||
+    value.contracts.marketContractId.length === 0
+  ) {
+    return false;
+  }
+  if (
+    typeof value.contracts.squadContractId !== "string" ||
+    value.contracts.squadContractId.length === 0
+  ) {
+    return false;
+  }
+  if (!isPlainObject(value.counters)) return false;
+  return (
+    isNonNegativeSafeInteger(value.counters.cycles) &&
+    isNonNegativeSafeInteger(value.counters.notificationsSent) &&
+    isNonNegativeSafeInteger(value.counters.notificationsFailed) &&
+    isNonNegativeSafeInteger(value.counters.eventsSkipped)
+  );
+}
+
+/** Parse + validate a counters file body; throws on JSON or schema failure. */
+export function parseCountersFile(raw: string): CountersFile {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch (err) {
+    throw new Error(`invalid JSON: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (!isPlainObject(parsed)) {
+    throw new Error("counters file root must be a JSON object");
+  }
+  if ("version" in parsed && parsed.version !== COUNTERS_SCHEMA_VERSION) {
+    throw new Error(
+      `counters file: unsupported schema version ${String(parsed.version)} ` +
+        `(this build understands version ${COUNTERS_SCHEMA_VERSION})`,
+    );
+  }
+  if (!isValidCountersFile(parsed)) {
+    throw new Error("failed schema validation (expected version 1 with contracts and counters)");
+  }
+  return {
+    version: COUNTERS_SCHEMA_VERSION,
+    updatedAt: parsed.updatedAt,
+    contracts: {
+      marketContractId: parsed.contracts.marketContractId,
+      squadContractId: parsed.contracts.squadContractId,
+    },
+    counters: {
+      cycles: parsed.counters.cycles,
+      notificationsSent: parsed.counters.notificationsSent,
+      notificationsFailed: parsed.counters.notificationsFailed,
+      eventsSkipped: parsed.counters.eventsSkipped,
+    },
+  };
+}
+
+/** Build the on-disk counters payload. */
+export function buildCountersFile(
+  contracts: { marketContractId: string; squadContractId: string },
+  counters: PollerCounters,
+  updatedAt: string,
+): CountersFile {
+  return {
+    version: COUNTERS_SCHEMA_VERSION,
+    updatedAt,
+    contracts: {
+      marketContractId: contracts.marketContractId,
+      squadContractId: contracts.squadContractId,
+    },
+    counters: {
+      cycles: counters.cycles,
+      notificationsSent: counters.notificationsSent,
+      notificationsFailed: counters.notificationsFailed,
+      eventsSkipped: counters.eventsSkipped,
+    },
   };
 }
 
@@ -1135,6 +1528,7 @@ export function buildDigests(
 }
 
 export function createPoller(deps: PollerDeps) {
+  const notifiedGaps = new Set<string>();
   const { config, server, send } = deps;
   const metrics = deps.metrics;
   const audit: AuditLog = deps.audit ?? createAuditLog();
@@ -1151,7 +1545,11 @@ export function createPoller(deps: PollerDeps) {
       DEFAULT_SEND_TIMEOUT_MS,
   };
   const now = deps.now ?? Date.now;
+  const hasCustomWallClock = deps.now !== undefined;
+  const hasCustomMonotonicClock = deps.monotonicNow !== undefined;
+  const notificationAge = new NotificationAge(deps.monotonicNow ?? (() => performance.now()));
   const sleep = deps.sleep ?? defaultSleep;
+  const activityBaseline = new ActivityBaseline(deps.activityBaselineOptions);
   const targetInitialBackoff = deps.targetBackoffOptions?.initialBackoffMs ?? config.pollIntervalMs;
   const targetMaxBackoff = deps.targetBackoffOptions?.maxBackoffMs ?? DEFAULT_TARGET_MAX_BACKOFF_MS;
   const targetBackoffFactor = deps.targetBackoffOptions?.backoffFactor ?? DEFAULT_TARGET_BACKOFF_FACTOR;
@@ -1188,7 +1586,8 @@ export function createPoller(deps: PollerDeps) {
   };
   const cursorPreview = (cursor: string | null): string => {
     if (cursor === null) return "none";
-    return boundedLabel(cursor, 24);
+    const ledger = eventCursorLedger(cursor);
+    return ledger !== null ? `ledger:${ledger}` : "opaque";
   };
 
   const targets: WatchTarget[] = [
@@ -1237,6 +1636,9 @@ export function createPoller(deps: PollerDeps) {
     targets.map((t) => [t.source, 0]),
   );
 
+  /** Bounded history of cursor recovery actions persisted alongside cursors. */
+  let recoveryHistory: CursorRecoveryRecord[] = [];
+
   // Per-contract redelivery guard. Kept out of `TargetState` so status output
   // stays plain data; the window is internal bookkeeping.
   const dedup = new Map<ContractSource, EventDedupWindow>(
@@ -1255,13 +1657,37 @@ export function createPoller(deps: PollerDeps) {
     // A Telegram error embeds the token in its request URL, and the queue is
     // the last place it belongs.
     secrets: [config.botToken],
+    networkPassphrase: config.networkPassphrase,
     now,
   });
+
+  /** Crash-safe send journal: intent before a send, done after. */
+  const sendJournalEnabled =
+    typeof config.sendJournalFile === "string" && config.sendJournalFile.length > 0;
+  let sendJournal: SendJournal | null = null;
+  if (sendJournalEnabled) {
+    sendJournal = createSendJournal({
+      filePath: config.sendJournalFile,
+      now,
+    });
+  }
+
+  /** Event ids that may already have been sent (crash recovery); never re-notified. */
+  const maybeSent = new Set<string>();
 
   /** Mirror the queue's counters into the status this poller reports. */
   function refreshDeadLetterStatus(): void {
     status.deadLetter = deadLetter.stats();
   }
+
+  const categoryCounter = createCategoryCounter({ config });
+
+  const sinceStartCounters: PollerCounters = {
+    cycles: 0,
+    notificationsSent: 0,
+    notificationsFailed: 0,
+    eventsSkipped: 0,
+  };
 
   const status: PollerStatus = {
     running: false,
@@ -1277,9 +1703,18 @@ export function createPoller(deps: PollerDeps) {
     oldestLedger: null,
     notificationsSent: 0,
     notificationsFailed: 0,
+    notificationAge: notificationAge.summary(),
     eventsSkipped: 0,
+    sinceStart: { ...sinceStartCounters },
+    cumulative: {
+      cycles: 0,
+      notificationsSent: 0,
+      notificationsFailed: 0,
+      eventsSkipped: 0,
+    },
     emptyPages: 0,
     pagesScanned: 0,
+    activityBaseline: activityBaseline.snapshot(),
     lastCycleEmptyPages: 0,
     lastCyclePages: 0,
     notificationsDropped: 0,
@@ -1306,6 +1741,16 @@ export function createPoller(deps: PollerDeps) {
     },
   };
 
+  function syncCounterSnapshots(): void {
+    status.sinceStart = { ...sinceStartCounters };
+    status.cumulative = {
+      cycles: status.cycles,
+      notificationsSent: status.notificationsSent,
+      notificationsFailed: status.notificationsFailed,
+      eventsSkipped: status.eventsSkipped,
+    };
+  }
+
   // One chain tip per poll cycle. An infinite TTL plus a `reset()` at the top
   // of each cycle means the tip is fetched exactly once per cycle however many
   // targets are watched, without a wall-clock expiry landing mid-cycle.
@@ -1319,6 +1764,13 @@ export function createPoller(deps: PollerDeps) {
   let instanceLock: InstanceLockHandle | null = null;
   /** Set when load migrates a legacy file so the first save rewrites disk ASAP. */
   let pendingRewrite = false;
+  let countersDirty = false;
+
+  // Hand-built configs (tests, embedders) may not set a counters file.
+  const countersFile =
+    typeof config.countersFile === "string" && config.countersFile.length > 0
+      ? config.countersFile
+      : "";
 
   async function releaseInstanceLock(): Promise<void> {
     const lock = instanceLock;
@@ -1343,6 +1795,130 @@ export function createPoller(deps: PollerDeps) {
     settleCycle = null;
     cycleSettled = null;
     settle?.();
+  }
+
+  // ── Counter persistence ────────────────────────────────────────────────────
+
+  function resetCumulativeCounters(): void {
+    status.cycles = sinceStartCounters.cycles;
+    status.notificationsSent = sinceStartCounters.notificationsSent;
+    status.notificationsFailed = sinceStartCounters.notificationsFailed;
+    status.eventsSkipped = sinceStartCounters.eventsSkipped;
+    syncCounterSnapshots();
+  }
+
+  async function loadCounters(): Promise<void> {
+    if (!countersFile) return;
+    let raw: string;
+    try {
+      raw = await readFile(countersFile, "utf8");
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      if (code === "ENOENT") {
+        resetCumulativeCounters();
+        return;
+      }
+      Logger.warn(
+        "poller",
+        `[poller] could not read counters file at ${countersFile}: ${errorMessage(err)}; starting fresh`,
+        { action: "counters_read_failed", countersFile, error: errorMessage(err) },
+      );
+      resetCumulativeCounters();
+      return;
+    }
+
+    let parsed: CountersFile;
+    try {
+      parsed = parseCountersFile(raw);
+    } catch (err) {
+      const reason = errorMessage(err);
+      Logger.warn(
+        "poller",
+        `[poller] counters file at ${countersFile} is corrupt or invalid (${reason}); starting fresh`,
+        { action: "counters_corrupt", countersFile, reason },
+      );
+      resetCumulativeCounters();
+      countersDirty = true;
+      return;
+    }
+
+    if (
+      parsed.contracts.marketContractId !== config.marketContractId ||
+      parsed.contracts.squadContractId !== config.squadContractId
+    ) {
+      Logger.warn(
+        "poller",
+        `[poller] counters file contract ids changed ` +
+          `(market ${parsed.contracts.marketContractId} -> ${config.marketContractId}, ` +
+          `squad ${parsed.contracts.squadContractId} -> ${config.squadContractId}); ` +
+          `starting fresh and resetting counters to 0`,
+        {
+          action: "counters_contract_changed",
+          countersFile,
+          previousMarketContractId: parsed.contracts.marketContractId,
+          marketContractId: config.marketContractId,
+          previousSquadContractId: parsed.contracts.squadContractId,
+          squadContractId: config.squadContractId,
+        },
+      );
+      resetCumulativeCounters();
+      countersDirty = true;
+      return;
+    }
+
+    status.cycles = parsed.counters.cycles + sinceStartCounters.cycles;
+    status.notificationsSent =
+      parsed.counters.notificationsSent + sinceStartCounters.notificationsSent;
+    status.notificationsFailed =
+      parsed.counters.notificationsFailed + sinceStartCounters.notificationsFailed;
+    status.eventsSkipped = parsed.counters.eventsSkipped + sinceStartCounters.eventsSkipped;
+    syncCounterSnapshots();
+    countersDirty = false;
+    Logger.info(
+      "poller",
+      `[poller] restored counters from ${countersFile}: ` +
+        `cycles=${status.cycles} sent=${status.notificationsSent} ` +
+        `failed=${status.notificationsFailed} skipped=${status.eventsSkipped}`,
+      {
+        action: "counters_restored",
+        countersFile,
+        counters: { ...status.cumulative },
+      },
+    );
+  }
+
+  async function saveCounters(reason: "cycle" | "shutdown"): Promise<boolean> {
+    if (!countersFile) return true;
+    syncCounterSnapshots();
+    const payload = buildCountersFile(
+      {
+        marketContractId: config.marketContractId,
+        squadContractId: config.squadContractId,
+      },
+      status.cumulative ?? {
+        cycles: status.cycles,
+        notificationsSent: status.notificationsSent,
+        notificationsFailed: status.notificationsFailed,
+        eventsSkipped: status.eventsSkipped,
+      },
+      new Date(now()).toISOString(),
+    );
+
+    try {
+      await mkdir(path.dirname(countersFile), { recursive: true });
+      const tmp = `${countersFile}.tmp`;
+      await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+      await rename(tmp, countersFile);
+      countersDirty = false;
+      return true;
+    } catch (err) {
+      Logger.error(
+        "poller",
+        `[poller] could not persist counters (${reason}): ${errorMessage(err)}`,
+        { action: "counters_persist_failed", reason, countersFile, error: errorMessage(err) },
+      );
+      return false;
+    }
   }
 
   // ── Cursor persistence ─────────────────────────────────────────────────────
@@ -1391,6 +1967,7 @@ export function createPoller(deps: PollerDeps) {
       // between two quiet scans would report `unknown` until the next event
       // happened to land, hiding a perfectly healthy (or long-stalled) chain.
       status.chainClockAt = parsed.chainClockAt ?? null;
+      recoveryHistory = parsed.recoveryHistory ? [...parsed.recoveryHistory] : [];
       audit.record(
         auditEntry("cursor_loaded", {
           detail: [...state.values()].map((t) => `${t.source}@${t.cursor ?? "none"}`).join(" "),
@@ -1407,7 +1984,7 @@ export function createPoller(deps: PollerDeps) {
           cursorFile: config.cursorFile,
           targets: [...state.values()].map((t) => ({
             source: t.source,
-            cursor: t.cursor,
+            cursorLedger: t.cursor ? eventCursorLedger(t.cursor) : null,
             lastEventLedger: t.lastEventLedger,
             rewindFromLedger: t.rewindFromLedger,
           })),
@@ -1418,6 +1995,14 @@ export function createPoller(deps: PollerDeps) {
       // keep the bad bytes for operators instead of overwriting them on save.
       const reason = errorMessage(err);
       await quarantineCorruptCursorFile(config.cursorFile, reason);
+      recoveryHistory = appendCursorRecoveryHistory(recoveryHistory, {
+        at: new Date(now()).toISOString(),
+        reason: "quarantine",
+        before: {},
+        after: snapshotCursorPositions(
+          Object.fromEntries([...state.values()].map((t) => [t.source, t])),
+        ),
+      });
     }
   }
 
@@ -1441,6 +2026,7 @@ export function createPoller(deps: PollerDeps) {
       })),
       new Date(now()).toISOString(),
       status.chainClockAt,
+      recoveryHistory,
     );
 
     try {
@@ -1533,10 +2119,39 @@ export function createPoller(deps: PollerDeps) {
   }
 
   function snapshot(): StatusSnapshot {
+    syncCounterSnapshots();
     return buildStatusSnapshot(config, {
       ...status,
       targets: [...state.values()].map((t) => ({ ...t })),
     });
+  }
+
+  function recordCycleIncrement(): void {
+    status.cycles += 1;
+    sinceStartCounters.cycles += 1;
+    countersDirty = true;
+    syncCounterSnapshots();
+  }
+
+  function recordSentIncrement(count = 1): void {
+    status.notificationsSent += count;
+    sinceStartCounters.notificationsSent += count;
+    countersDirty = true;
+    syncCounterSnapshots();
+  }
+
+  function recordFailedIncrement(count = 1): void {
+    status.notificationsFailed += count;
+    sinceStartCounters.notificationsFailed += count;
+    countersDirty = true;
+    syncCounterSnapshots();
+  }
+
+  function recordSkippedIncrement(count = 1): void {
+    status.eventsSkipped += count;
+    sinceStartCounters.eventsSkipped += count;
+    countersDirty = true;
+    syncCounterSnapshots();
   }
 
   /**
@@ -1601,6 +2216,7 @@ export function createPoller(deps: PollerDeps) {
   async function notify(
     events: DecodedEvent[],
     correlationId: string,
+    ingested: NotificationIngestionMark = notificationAge.markIngested(now()),
   ): Promise<NotificationResult> {
     let sentThisCycle = 0;
     let failed = 0;
@@ -1610,9 +2226,10 @@ export function createPoller(deps: PollerDeps) {
 
     for (const event of events) {
       metrics?.eventsDecoded.inc();
+      categoryCounter.record(event);
 
       if (isAdminPayload(event.payload)) {
-        status.eventsSkipped += 1;
+        recordSkippedIncrement();
         metrics?.eventsSkipped.inc();
         skipped += 1;
         const adminAudit = toAdminAuditRecord(event, config);
@@ -1625,7 +2242,7 @@ export function createPoller(deps: PollerDeps) {
       }
 
       if (event.payload.name === "unknown") {
-        status.eventsSkipped += 1;
+        recordSkippedIncrement();
         metrics?.eventsSkipped.inc();
         skipped += 1;
         audit.record(
@@ -1638,26 +2255,20 @@ export function createPoller(deps: PollerDeps) {
         );
         // Event name and reason come from remote contract data: bound them so
         // they cannot produce unbounded log output.
-        Logger.info(
-          "poller",
+        console.log(
           `[poller] skipped ${event.source} event "${boundedLabel(event.payload.eventName, 80)}" ` +
             `at ledger ${event.ledger}` +
             (event.payload.reason ? ` (${boundedLabel(event.payload.reason, 160)})` : "") +
             ` correlation=${correlationId}`,
-          {
-            action: "event_skipped",
-            source: event.source,
-            eventName: boundedLabel(event.payload.eventName, 80),
-            ledger: event.ledger,
-            reason: boundedLabel(event.payload.reason ?? "", 160),
-          },
         );
         continue;
       }
 
       if (!isNotificationAllowed(config.featureFlags, event.source, event.payload.name)) {
-        status.eventsSkipped += 1;
+        recordSkippedIncrement();
         metrics?.eventsSkipped.inc();
+        metrics?.eventsFiltered.inc();
+        metrics?.eventsFilteredFeatureFlag.inc();
         skipped += 1;
         console.log(
           `[poller] feature-flag skipped ${event.source} event "${boundedLabel(event.payload.name, 80)}" ` +
@@ -1690,15 +2301,14 @@ export function createPoller(deps: PollerDeps) {
           // below is unchanged: either path counts as sent, neither as skipped.
           const plainText = formatPlainTextEvent(config, event);
           const eventRef = { eventId: event.eventId, ledger: event.ledger, source: event.source };
-          if (reply_markup || plainText !== null) {
-            extra = {
-              ...(reply_markup ? { reply_markup } : {}),
-              ...(plainText !== null ? { plainText, eventRef } : {}),
-            };
-          }
+          extra = {
+            eventName: event.payload.name,
+            ...(reply_markup ? { reply_markup } : {}),
+            ...(plainText !== null ? { plainText, eventRef } : {}),
+          };
         }
       } catch (err) {
-        status.eventsSkipped += 1;
+        recordSkippedIncrement();
         metrics?.eventsSkipped.inc();
         skipped += 1;
         Logger.error(
@@ -1716,8 +2326,10 @@ export function createPoller(deps: PollerDeps) {
         continue;
       }
       if (text === null) {
-        status.eventsSkipped += 1;
+        recordSkippedIncrement();
         metrics?.eventsSkipped.inc();
+        metrics?.eventsFiltered.inc();
+        metrics?.eventsFilteredRule.inc();
         skipped += 1;
         audit.record(
           auditEntry("event_skipped", {
@@ -1729,7 +2341,7 @@ export function createPoller(deps: PollerDeps) {
       }
 
       if (sentThisCycle >= config.maxNotificationsPerCycle) {
-        status.eventsSkipped += 1;
+        recordSkippedIncrement();
         metrics?.eventsSkipped.inc();
         skipped += 1;
         // One summary line per cycle names the knob; each drop is still logged.
@@ -1765,6 +2377,45 @@ export function createPoller(deps: PollerDeps) {
         continue;
       }
 
+      // Crash recovery: an event that may already have been sent is treated as
+      // committed (the existing lossy cursor-commit policy) so a crash between
+      // sendMessage and the cursor commit never duplicates a notification.
+      if (sendJournal && maybeSent.has(event.eventId)) {
+        status.eventsSkipped += 1;
+        skipped += 1;
+        try {
+          await sendJournal.recordDone(event.eventId);
+        } catch (err) {
+          console.error(
+            `[poller] send journal done failed for ${event.eventId}: ${safeErrorMessage(err)}`,
+          );
+        }
+        continue;
+      }
+
+      // Record intent before the send so a crash between sendMessage and the
+      // cursor commit is detectable on restart instead of guessed at.
+      if (sendJournal) {
+        try {
+          const textHash = createHash("sha256")
+            .update(text)
+            .digest("hex")
+            .slice(0, 16);
+          await sendJournal.recordIntent({
+            id: event.eventId,
+            source: event.source,
+            ledger: event.ledger,
+            eventName: event.payload.name,
+            textHash,
+            at: now(),
+          });
+        } catch (err) {
+          console.error(
+            `[poller] send journal intent failed for ${event.eventId}: ${safeErrorMessage(err)}`,
+          );
+        }
+      }
+
       try {
         // Use bounded retry for Telegram sends to handle transient failures
         await sendWithRetry(
@@ -1775,14 +2426,29 @@ export function createPoller(deps: PollerDeps) {
           () => !status.stopping,
           sleep,
         );
-        status.notificationsSent += 1;
+        recordSentIncrement();
         metrics?.notificationsSent.inc();
+        const ageMs =
+          hasCustomWallClock && !hasCustomMonotonicClock
+            ? notificationAge.record(event.at, Math.max(ingested.wallMs, now()))
+            : notificationAge.recordFromIngestion(event.at, ingested);
+        metrics?.recordNotificationAge(ageMs);
+        status.notificationAge = notificationAge.summary();
         sentThisCycle += 1;
+        if (sendJournal) {
+          try {
+            await sendJournal.recordDone(event.eventId);
+          } catch (err) {
+            console.error(
+              `[poller] send journal done failed for ${event.eventId}: ${safeErrorMessage(err)}`,
+            );
+          }
+        }
       } catch (err) {
         // All retries exhausted. The event still counts as failed and the cursor
         // still advances — but the message is parked instead of dropped, so a
         // transient Telegram outage costs a delay rather than the notification.
-        status.notificationsFailed += 1;
+        recordFailedIncrement();
         metrics?.notificationsFailed.inc();
         failed += 1;
         audit.recordError(err, "send_failed", {
@@ -1846,7 +2512,7 @@ export function createPoller(deps: PollerDeps) {
         );
       }, Math.max(0, config.maxNotificationsPerCycle));
       if (flushed.sent > 0) {
-        status.notificationsSent += flushed.sent;
+        recordSentIncrement(flushed.sent);
         for (let i = 0; i < flushed.sent; i += 1) metrics?.notificationsSent.inc();
       }
     } catch (err) {
@@ -1919,9 +2585,29 @@ export function createPoller(deps: PollerDeps) {
     const missed = cursorLedger === null ? 0 : Math.max(0, window.oldestLedger - cursorLedger);
     rewindAttempts.set(target.source, attempts + 1);
     const at = now();
+    const beforePosition: CursorRecoveryPosition = {
+      cursor: current.cursor,
+      lastEventLedger: current.lastEventLedger,
+      ...(typeof current.rewindFromLedger === "number"
+        ? { rewindFromLedger: current.rewindFromLedger }
+        : {}),
+    };
     current.cursor = null;
     current.lastEventLedger = null;
     current.rewindFromLedger = window.oldestLedger;
+    recoveryHistory = appendCursorRecoveryHistory(recoveryHistory, {
+      at: new Date(at).toISOString(),
+      reason: "floor_rewind",
+      source: target.source,
+      before: { [target.source]: beforePosition },
+      after: {
+        [target.source]: {
+          cursor: current.cursor,
+          lastEventLedger: current.lastEventLedger,
+          rewindFromLedger: current.rewindFromLedger,
+        },
+      },
+    });
     // The position becomes a floor walk, so any "could not be read" flag it
     // carried is spent. The gap itself is what an operator needs, and it is
     // recorded once per occurrence: after the rewind the position *is* the
@@ -1939,6 +2625,20 @@ export function createPoller(deps: PollerDeps) {
       oldestLedger: window.oldestLedger,
       missedLedgers: missed,
     };
+    const gapKey = `${target.source}:${cursorLedger ?? window.oldestLedger}:${window.oldestLedger}`;
+    if (!notifiedGaps.has(gapKey)) {
+      notifiedGaps.add(gapKey);
+      if (deps.notifyOperator && config.operatorTelegramUserId) {
+        const alertText = formatRestartGapAlert({
+          source: target.source,
+          cursorLedger: cursorLedger ?? window.oldestLedger,
+          oldestLedger: window.oldestLedger,
+        });
+        void deps.notifyOperator(alertText).catch((err) => {
+          console.error(`[poller] failed to notify operator of restart gap: ${safeErrorMessage(err)}`);
+        });
+      }
+    }
     markDirty();
     console.warn(
       `[poller] ${target.source}: restart gap — cursor at ledger ${cursorLedger} is ` +
@@ -1998,7 +2698,7 @@ export function createPoller(deps: PollerDeps) {
     inFlight = true;
     let explicitBackoff: number | null = null;
     beginCycleTracking();
-    status.cycles += 1;
+    recordCycleIncrement();
     const correlationId = randomUUID();
     status.lastCorrelationId = correlationId;
     const currentTime = now();
@@ -2038,6 +2738,33 @@ export function createPoller(deps: PollerDeps) {
     let cyclePages = 0;
     let cycleEmptyPages = 0;
     let cycleFailures = 0;
+    let cycleScans = 0;
+    // Events handed back by every successful scan in this cycle. Compared with
+    // the rolling baseline only when every target was scanned, so a target in
+    // backoff cannot make a normal cycle look quiet.
+    let cycleEvents = 0;
+    const cycleTargets: Record<ContractSource, CycleTargetSummary> = {
+      market: {
+        source: "market",
+        fetched: 0,
+        decoded: 0,
+        sent: 0,
+        skipped: 0,
+        cursorLedger: state.get("market")?.cursor
+          ? eventCursorLedger(state.get("market")!.cursor!)
+          : null,
+      },
+      squad: {
+        source: "squad",
+        fetched: 0,
+        decoded: 0,
+        sent: 0,
+        skipped: 0,
+        cursorLedger: state.get("squad")?.cursor
+          ? eventCursorLedger(state.get("squad")!.cursor!)
+          : null,
+      },
+    };
 
     // Drain parked sends before this cycle's events, so a recovered channel
     // catches up in order. Budgeted like the burst below: one recovery must
@@ -2091,6 +2818,7 @@ export function createPoller(deps: PollerDeps) {
                 !rewinding && current.cursor === null ? config.startLookbackLedgers : undefined,
               seenEventIds: dedupWindow.toJSON(),
               dedupWindow: config.dedupWindow,
+              shouldDecode: (name) => isNotificationAllowed(config.featureFlags, target.source, name),
             }),
             SCAN_TIMEOUT_MS,
             "RPC scan",
@@ -2108,6 +2836,8 @@ export function createPoller(deps: PollerDeps) {
           current.nextEligibleAt = null;
           anyOk = true;
 
+          cycleScans += 1;
+          cycleEvents += scan.events.length;
           cyclePages += scan.pages;
           cycleEmptyPages += scan.emptyPages;
           status.pagesScanned += scan.pages;
@@ -2198,8 +2928,9 @@ export function createPoller(deps: PollerDeps) {
           // never be recorded.
           for (const id of scan.seenEventIds) dedupWindow.add(id);
           if (scan.events.length > 0) {
+            const ingested = notificationAge.markIngested(now());
             markDirty();
-            delivery = await notify(scan.events, correlationId);
+            delivery = await notify(scan.events, correlationId, ingested);
             const skippedText = delivery.skipped > 0 ? ` (${delivery.skipped} skipped)` : "";
             console.log(
               `[poller] ${target.source}: ${scan.events.length} event(s) ` +
@@ -2242,6 +2973,19 @@ export function createPoller(deps: PollerDeps) {
           const newest = scan.events[scan.events.length - 1];
           if (newest !== undefined) current.lastEvent = newest;
 
+          const decodedCount = scan.events.reduce(
+            (acc, event) => (event.payload.name !== "unknown" ? acc + 1 : acc),
+            0,
+          );
+          cycleTargets[target.source] = {
+            source: target.source,
+            fetched: scan.events.length,
+            decoded: decodedCount,
+            sent: delivery.sent,
+            skipped: delivery.skipped,
+            cursorLedger: current.cursor ? eventCursorLedger(current.cursor) : null,
+          };
+
           trackCursorAdvance(current, previousCursor, scan.latestLedger);
         } catch (err) {
           cycleFailures++;
@@ -2283,7 +3027,11 @@ export function createPoller(deps: PollerDeps) {
             await rewindFromRetainedFloor(target, current);
           }
 
-          const retryAfterMs = extractRetryAfterMs(err);
+          cycleTargets[target.source].cursorLedger = current.cursor
+            ? eventCursorLedger(current.cursor)
+            : null;
+
+          const retryAfterMs = extractRetryAfterMs(err, targetMaxBackoff);
           if (retryAfterMs !== null) {
             console.warn(`[poller] RPC requested backoff for ${retryAfterMs}ms`);
             explicitBackoff = retryAfterMs;
@@ -2319,16 +3067,66 @@ export function createPoller(deps: PollerDeps) {
         status.lastSuccessAt = now();
         status.consecutiveFailures = 0;
         metrics?.consecutiveFailures.set(0);
+
+        // Compare this cycle's activity with what recent complete cycles
+        // looked like. Incomplete cycles are skipped rather than recorded at a
+        // lower count: an RPC backoff is not a quiet chain.
+        if (cycleScans === targets.length) {
+          const comparison = activityBaseline.record(cycleEvents);
+          status.activityBaseline = activityBaseline.snapshot();
+          metrics?.lastCycleEvents.set(cycleEvents);
+          if (comparison.mean !== null) {
+            metrics?.activityBaselineEvents.set(Math.round(comparison.mean));
+          }
+          if (comparison.anomalous) {
+            metrics?.activityAnomalies.inc();
+            // Counts only: no event payloads, cursors, or RPC text. One line
+            // per anomalous cycle, which is exactly when an operator wants it.
+            console.warn(
+              `[poller] activity ${comparison.deviation}: ${cycleEvents} event(s) this cycle ` +
+                `vs baseline mean ${(comparison.mean ?? 0).toFixed(1)} ` +
+                `(z=${(comparison.zScore ?? 0).toFixed(2)}, ${comparison.samples} prior cycles)`,
+            );
+          }
+        }
       } else {
         status.consecutiveFailures += 1;
         metrics?.consecutiveFailures.set(status.consecutiveFailures);
         emitCircuitBreakerWarning();
+      }
+
+      const durationMs = Math.max(0, now() - currentTime);
+      const isIdleCycle =
+        cycleFailures === 0 &&
+        Object.values(cycleTargets).every(
+          (t) => t.fetched === 0 && t.decoded === 0 && t.sent === 0 && t.skipped === 0,
+        );
+      const sample = isIdleCycle ? errorSampler.record("cycle:idle") : { log: true, suppressed: 0 };
+      if (sample.log) {
+        const m = cycleTargets.market;
+        const s = cycleTargets.squad;
+        const summaryFields: CycleSummaryFields = {
+          action: "cycle_summary",
+          cycle: status.cycles,
+          durationMs,
+          targets: cycleTargets,
+          suppressed: sample.suppressed,
+        };
+        Logger.info(
+          "poller",
+          `[poller] cycle #${status.cycles} in ${durationMs}ms ` +
+            `market(fetched=${m.fetched} decoded=${m.decoded} sent=${m.sent} skipped=${m.skipped} cursorLedger=${m.cursorLedger ?? "none"}) ` +
+            `squad(fetched=${s.fetched} decoded=${s.decoded} sent=${s.sent} skipped=${s.skipped} cursorLedger=${s.cursorLedger ?? "none"})` +
+            formatSuppressedRepeats(sample.suppressed, errorSampler.windowMs),
+          summaryFields as unknown as Record<string, unknown>,
+        );
       }
     } finally {
       // The write and the tracking promise are what a shutdown waits for, so
       // they run even when the body above threw.
       try {
         status.targets = [...state.values()].map((t) => ({ ...t }));
+        await saveCounters("cycle");
         await saveCursors("cycle");
         await persistStatus();
       } finally {
@@ -2441,9 +3239,22 @@ export function createPoller(deps: PollerDeps) {
       }
 
       await loadCursors();
+      await loadCounters();
       // Parked sends from the previous run are part of this run's work.
       await deadLetter.load();
       refreshDeadLetterStatus();
+
+      // Recover which notifications may already have been sent: an intent
+      // without a matching done means a crash happened between sendMessage and
+      // the cursor commit. Treat them as committed so a restart never duplicates
+      // them (the existing lossy cursor-commit policy).
+      if (sendJournal) {
+        for (const entry of await sendJournal.loadPending()) {
+          maybeSent.add(entry.id);
+        }
+        await sendJournal.compact();
+      }
+
       stopped = false;
       paused = false;
       status.paused = false;
@@ -2586,6 +3397,10 @@ export function createPoller(deps: PollerDeps) {
         console.log("[poller] cursor file already matches memory; nothing to flush");
       }
 
+      if (countersDirty) {
+        await saveCounters("shutdown");
+      }
+
       status.running = false;
       await persistStatus();
       await releaseInstanceLock();
@@ -2594,11 +3409,20 @@ export function createPoller(deps: PollerDeps) {
 
     status(): PollerStatus {
       refreshDeadLetterStatus();
+      syncCounterSnapshots();
       return {
         ...status,
+        sinceStart: { ...sinceStartCounters },
+        cumulative: {
+          cycles: status.cycles,
+          notificationsSent: status.notificationsSent,
+          notificationsFailed: status.notificationsFailed,
+          eventsSkipped: status.eventsSkipped,
+        },
         ledgerCache: ledgerCache.stats(),
         suppressedLogs: errorSampler.suppressedTotal(),
         targets: [...state.values()].map((t) => ({ ...t })),
+        categories: categoryCounter.countsRecord(),
       };
     },
 
@@ -2621,6 +3445,7 @@ export function createPoller(deps: PollerDeps) {
      * race that `start()` introduces.
      */
     loadCursors,
+    loadCounters,
     /** Machine-readable snapshot, same shape as the file on disk. */
     snapshot(): StatusSnapshot {
       return snapshot();
@@ -2642,6 +3467,7 @@ export function createPoller(deps: PollerDeps) {
     async pollOnce(): Promise<void> {
       if (status.startedAt === 0) {
         await loadCursors();
+        await loadCounters();
         status.running = true;
         status.startedAt = Date.now();
       }

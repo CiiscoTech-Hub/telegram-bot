@@ -74,12 +74,14 @@ The replay CLI is invoked via `npm run replay -- [flags]` or entrypoint `src/rep
 | `--show` | `<number>` | Number of individual event dispositions to include in the report log. | `0` (summaries only; eventLog is also included during dry-run) |
 | `--json` | Boolean flag | Write a single JSON report (`mimir-replay-v1`) to `stdout`. Logs route to `stderr`. | `false` |
 | `--mock` | Boolean flag | Select the local mock profile (`MIMIR_PROFILE=mock`). | `false` |
+| `--progress-file` | `<path>` | Persist per-page checkpoint state (`mimir-replay-progress-v1`) for resumable replays. Includes a normalized `filterFingerprint` (network, range, contracts, and contract IDs); incompatible resume attempts are rejected with exit code `2` and an actionable message. | None |
+| `--rpm` | `<number>` | Maximum RPC requests per minute across health and event fetches. Must be $> 0$. | Unlimited |
 
 ### Exit Codes
 
 * **`0`:** Scan completed successfully (even if some events were skipped, deduplicated, or capped).
 * **`1`:** Fatal runtime error (RPC unreachable, invalid network passphrase, or missing config in `--send` mode).
-* **`2`:** Usage error (missing `--from`, non-numeric or negative ledger, `--to` earlier than `--from`, or invalid `--contract`).
+* **`2`:** Usage error (missing `--from`, non-numeric or negative ledger, `--to` earlier than `--from`, invalid `--contract`/`--rpm`, or an incompatible/corrupt `--progress-file`).
 
 ---
 
@@ -181,7 +183,7 @@ The replay engine applies identical decoding and deduplication rules as the live
 Soroban RPC nodes maintain a rolling window of history (typically ~120,960 ledgers, or approximately 7 days on Testnet).
 
 * **The Retained Floor:** `server.getHealth()` returns `oldestLedger`. Requesting a start ledger below `oldestLedger` is refused by the RPC.
-* **Automatic Clamping:** The replay engine clamps `--from` up to `oldestLedger` and emits a warning.
+* **Automatic Clamping (`clampStartLedger`):** The replay engine invokes `clampStartLedger` (`src/stellar/replay.ts`) to clamp `--from` up to `oldestLedger`, sets `startClamped: true` on the walk summary, and emits a boundary warning.
 * **When Missed Ledgers are Below the Floor:**
   If an outage lasted longer than the retention window:
   1. The replay CLI can only recover events from `oldestLedger` to the recovery point.
@@ -207,6 +209,11 @@ npm run mock:rpc
 npm run replay:mock -- --from 900 --to 1000
 ```
 *(Or pass `--mock` directly: `npm run replay -- --from 900 --to 1000 --mock`)*
+
+For machine-readable verification in monitoring or operational scripts, append `--json`:
+```bash
+npm run replay:mock -- --from 900 --to 1000 --json
+```
 
 ### Verify Output
 

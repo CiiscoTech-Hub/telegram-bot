@@ -148,6 +148,7 @@ async function main(): Promise<void> {
   );
   console.log(`[boot] cursor file  ${config.cursorFile}`);
   console.log(`[boot] flags        ${formatFeatureFlags(config.featureFlags)}`);
+  console.log(`[boot] locale       ${config.locale}`);
   console.log(`[boot] audit file   ${config.auditFile}`);
   console.log(`[boot] lock file    ${config.lockFile}`);
   console.log(`[boot] shutdown     ${config.shutdownTimeoutMs}ms drain budget`);
@@ -255,6 +256,11 @@ async function main(): Promise<void> {
     config,
     server,
     send: (text, source, extra) => notify(text, source, extra),
+    notifyOperator: config.operatorTelegramUserId
+      ? async (text: string) => {
+          await bot.api.sendMessage(config.operatorTelegramUserId!, text);
+        }
+      : undefined,
     audit,
     metrics,
   });
@@ -341,6 +347,10 @@ async function main(): Promise<void> {
     }
     shuttingDown = true;
     Logger.info("shutdown", `[shutdown] ${signal} received, draining`, { signal });
+
+    // Transition readiness to false immediately before stopping polling so
+    // supervisors stop routing probes/work while liveness stays 200 during drain.
+    healthServer.beginShutdown();
 
     // A clean-stop marker closes the audit window: anything after it belongs to
     // the next run, which is how an operator tells a crash from a restart.
