@@ -9,20 +9,43 @@
  *   - {@link isMarkdownParseError} — classifier for Telegram entity-parse failures
  *   - {@link notifierSkips}    — counters for suppressed sends
  *   - {@link createNotifier}   — factory that returns the poller's send function
+ *   - {@link previewRouting}   — read-only routing preview (no Telegram calls)
+ *   - {@link routeStatus}      — actionable status when zero routes are active
  */
 
+import { createHash } from "node:crypto";
 import type { Bot } from "grammy";
 
 import { applyChatMigration, type BotConfig } from "../config.js";
 import type { ContractSource } from "../stellar/decode.js";
 import {
+  isTimeoutError,
   safeErrorMessage,
   splitTelegramMessage,
   type ExplorerKeyboard,
 } from "./format.js";
 import { DEFAULT_SILENT_EVENTS, isSilent } from "./priority.js";
+import type { SendJournal } from "./send-journal.js";
+
+// Re-export isTimeoutError so callers that only import from notifier.ts
+// can classify timeout errors without also depending on format.ts directly.
+export { isTimeoutError } from "./format.js";
 
 // ── SendExtra ────────────────────────────────────────────────────────────────
+
+/** A Telegram destination: a chat id plus an optional forum topic (thread) id. */
+export interface NotificationDestination {
+  chatId: string;
+  topicId?: number | undefined;
+}
+
+/** Optional dependencies for {@link createNotifier}. */
+export interface NotifierOptions {
+  /** Optional send journal for persisting per-destination delivery outcomes. */
+  sendJournal?: SendJournal | undefined;
+  /** Clock override for journal timestamps (defaults to `Date.now`). */
+  now?: (() => number) | undefined;
+}
 
 /** Extra Telegram send options the poller may attach to a notification. */
 export interface SendExtra {
@@ -46,6 +69,17 @@ export interface SendExtra {
   replyToMessageId?: number | undefined;
   /** Decoded contract event name used to apply silent-notification policy. */
   eventName?: string | undefined;
+  /**
+   * Optional callback invoked when the send timed out before Telegram
+   * responded. The notification may or may not have been accepted — this is an
+   * **unknown outcome**, distinct from a confirmed rejection (4xx error).
+   * Callers that maintain a send journal should call `journal.recordTimeout(id)`
+   * inside this hook to flag the pending intent as a confirmed-unknown outcome
+   * so recovery tooling can distinguish it from a plain crash-recovery intent.
+   * The error that triggered the timeout is passed for bounded logging; never
+   * re-throw from this callback.
+   */
+  onTimeout?: ((err: unknown) => void) | undefined;
 }
 
 // ── isMarkdownParseError ─────────────────────────────────────────────────────
@@ -118,6 +152,59 @@ function eventRefLabel(eventRef: SendExtra["eventRef"]): string {
   return parts.length > 0 ? ` (${parts.join(" ")})` : "";
 }
 
+/** Resolves the destination chat id for a contract source. */
+function resolveChatId(
+  config: Pick<BotConfig, "chatId" | "marketChatId" | "squadChatId"> & Partial<Pick<BotConfig, "chatIds">>,
+  source: ContractSource | undefined,
+): string {
+  const defaultChat = config.chatId ?? config.chatIds?.[0] ?? "";
+  if (source === "market") return config.marketChatId || defaultChat;
+  if (source === "squad") return config.squadChatId || defaultChat;
+  return defaultChat;
+}
+
+/** Resolves whether link previews are disabled for a contract source. */
+function resolveLinkPreviewDisabled(
+  config: Partial<Pick<BotConfig, "linkPreviewMarket" | "linkPreviewSquad">>,
+  source: ContractSource | undefined,
+): boolean {
+  if (source === "market") return !config.linkPreviewMarket;
+  if (source === "squad") return !config.linkPreviewSquad;
+  return true;
+}
+
+// ── routeStatus ──────────────────────────────────────────────────────────────
+
+/** Outcome of checking which configured notification routes are active. */
+export type RouteStatus =
+  | { state: "active"; activeRoutes: number }
+  | {
+      state: "no-active-routes";
+      activeRoutes: 0;
+      /** Human-readable, actionable explanation. Never claims delivery. */
+      message: string;
+    };
+
+/**
+ * Report whether any notification route is active. A zero-active-route result
+ * is reported distinctly from healthy delivery, and it never implies that a
+ * notification was delivered.
+ *
+ * `activeRoutes` is the count of routes the caller considers enabled; when it
+ * is zero the result is `no-active-routes` with an actionable message.
+ */
+export function routeStatus(activeRoutes: number): RouteStatus {
+  if (Number.isFinite(activeRoutes) && activeRoutes > 0) {
+    return { state: "active", activeRoutes: Math.floor(activeRoutes) };
+  }
+  return {
+    state: "no-active-routes",
+    activeRoutes: 0,
+    message:
+      "No notification routes are enabled: every configured route is disabled, so no notifications will be sent. Enable at least one route in the chat configuration (chatId, marketChatId, squadChatId) to receive notifications. No delivery has been attempted or confirmed.",
+  };
+}
+
 // ── notifierSkips ────────────────────────────────────────────────────────────
 
 /**
@@ -125,6 +212,59 @@ function eventRefLabel(eventRef: SendExtra["eventRef"]): string {
  * empty-text tests) can prove a blank render never reached the Telegram API.
  */
 export const notifierSkips = { emptyText: 0 };
+
+// ── previewRouting ───────────────────────────────────────────────────────────
+
+/** Result of previewing where a notification would be delivered. */
+export interface RoutingPreview {
+  /** Destinations that will receive the message. */
+  matched: Array<{ chatId: string; source: ContractSource | undefined }>;
+  /** Destinations suppressed by policy (empty render, blank chat id). */
+  filtered: Array<{ source: ContractSource | undefined; reason: "empty-text" | "no-chat-id" }>;
+  /** Destinations that cannot be reached (no chat configured for the source). */
+  unavailable: Array<{ source: ContractSource | undefined; reason: "no-chat-id" }>;
+  /** Whether the message would be sent silently. */
+  silent: boolean;
+  /** Link preview disabled flag used for the destination. */
+  linkPreviewDisabled: boolean;
+}
+
+/**
+ * Previews the routing decision for a notification without calling Telegram.
+ * Uses the same chat resolution, empty-text guard, and silent/link-preview
+ * policy as {@link createNotifier}, so the preview cannot drift from delivery.
+ */
+export function previewRouting(
+  text: string | null,
+  config: Pick<BotConfig, "chatId" | "marketChatId" | "squadChatId"> &
+    Partial<Pick<BotConfig, "chatIds" | "linkPreviewMarket" | "linkPreviewSquad" | "silentEvents">>,
+  source?: ContractSource,
+  extra?: Pick<SendExtra, "eventName">,
+): RoutingPreview {
+  const preview: RoutingPreview = {
+    matched: [],
+    filtered: [],
+    unavailable: [],
+    silent: Boolean(
+      extra?.eventName && isSilent(extra.eventName, config.silentEvents ?? DEFAULT_SILENT_EVENTS),
+    ),
+    linkPreviewDisabled: resolveLinkPreviewDisabled(config, source),
+  };
+
+  if (typeof text !== "string" || text.trim() === "") {
+    preview.filtered.push({ source, reason: "empty-text" });
+    return preview;
+  }
+
+  const chatId = resolveChatId(config, source);
+  if (chatId.trim() === "") {
+    preview.unavailable.push({ source, reason: "no-chat-id" });
+    return preview;
+  }
+
+  preview.matched.push({ chatId, source });
+  return preview;
+}
 
 // ── createNotifier ───────────────────────────────────────────────────────────
 
@@ -169,7 +309,7 @@ export function createNotifier(
   const migrations = new Map<string, string>();
   const secrets = typeof config.botToken === "string" ? [config.botToken] : [];
 
-  function resolveChatId(chatId: string): string {
+  function resolveMigratedChatId(chatId: string): string {
     let current = chatId;
     const seen = new Set<string>();
     while (migrations.has(current) && !seen.has(current)) {
@@ -184,7 +324,7 @@ export function createNotifier(
     const to = toChatId.trim();
     if (!from || !to || from === to) return false;
     // Prevent cyclic migrations (e.g. to -> ... -> from).
-    if (resolveChatId(to) === from) return false;
+    if (resolveMigratedChatId(to) === from) return false;
     if (migrations.get(from) === to) return false;
 
     migrations.set(from, to);
@@ -216,6 +356,7 @@ export function createNotifier(
       for (const [index, part] of parts.entries()) {
         await bot.api.sendMessage(chatId, part, {
           ...notificationOptions,
+          ...threadOption,
           ...(index === parts.length - 1 && extra?.reply_markup
             ? { reply_markup: extra.reply_markup }
             : {}),
@@ -230,6 +371,7 @@ export function createNotifier(
     try {
       await bot.api.sendMessage(chatId, text, {
         ...notificationOptions,
+        ...threadOption,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
         ...(replyToMessageId !== undefined
           ? { reply_parameters: { chat_id: chatId, message_id: replyToMessageId } }
@@ -237,6 +379,17 @@ export function createNotifier(
       });
       return;
     } catch (err) {
+      // When the HTTP call timed out, the notification may have been accepted
+      // by Telegram even though the client received no response. Notify the
+      // caller so it can flag the pending journal intent as an unknown outcome
+      // rather than a confirmed rejection, before the error propagates.
+      if (isTimeoutError(err) && typeof extra?.onTimeout === "function") {
+        try {
+          extra.onTimeout(err);
+        } catch {
+          // onTimeout must never interrupt the error path.
+        }
+      }
       // A blank fallback is no fallback: sending whitespace-only text would
       // just draw the same 400, so the original parse error propagates.
       const fallback = extra?.plainText;
@@ -254,6 +407,7 @@ export function createNotifier(
       await bot.api.sendMessage(chatId, fallback, {
         link_preview_options: notificationOptions.link_preview_options,
         ...silentOption,
+        ...threadOption,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
         ...(replyToMessageId !== undefined
           ? { reply_parameters: { chat_id: chatId, message_id: replyToMessageId } }
@@ -279,21 +433,11 @@ export function createNotifier(
       return;
     }
 
-    const defaultChat = config.chatId ?? config.chatIds?.[0] ?? "";
-    const configuredChatId = source === "market"
-      ? config.marketChatId || defaultChat
-      : source === "squad"
-        ? config.squadChatId || defaultChat
-        : defaultChat;
-    const chatId = resolveChatId(configuredChatId);
+    const chatId = resolveChatId(config, source);
 
     // Select link preview settings based on the contract source.
     // Commands (where source is undefined) always use TELEGRAM_OPTIONS (disabled).
-    const linkPreviewDisabled = source === "market"
-      ? !config.linkPreviewMarket
-      : source === "squad"
-        ? !config.linkPreviewSquad
-        : true;
+    const linkPreviewDisabled = resolveLinkPreviewDisabled(config, source);
 
     const silentOption = extra?.eventName && isSilent(extra.eventName, config.silentEvents ?? DEFAULT_SILENT_EVENTS)
       ? { disable_notification: true }
@@ -316,5 +460,5 @@ export function createNotifier(
     }
   };
 
-  return Object.assign(notify, { migrateRoute, resolveChatId });
+  return Object.assign(notify, { migrateRoute, resolveChatId: resolveMigratedChatId });
 }

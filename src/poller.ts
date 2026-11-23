@@ -82,8 +82,11 @@ import {
 } from "./deadLetter.js";
 import {
   createSendJournal,
+  type OrphanDecision,
+  type OrphanedJournalEntry,
   type SendJournal,
 } from "./notifications/send-journal.js";
+import { resolveRouteChatId } from "./notifications/notifier.js";
 import {
   acquireInstanceLock,
   InstanceLockError,
@@ -113,14 +116,20 @@ import {
   isAdminPayload,
   normalizeContractVersion,
   toAdminAuditRecord,
+  isContractVersionSupported,
+  validateDecoderCombinations,
+  getDecoderCapabilityReport,
   type ContractSource,
   type DecodedEvent,
+  type DecoderCapabilityReport,
 } from "./stellar/decode.js";
 
 export interface TargetState {
   source: ContractSource;
   contractId: string;
   version: string;
+  /** Whether the configured contract version is supported by the decoder subsystem. */
+  supportedVersion?: boolean;
   /** Duration of this target's most recent attempted fetch-decode-send cycle. */
   lastCycleMs: number;
   /** Longest attempted cycle for this target since process start. */
@@ -413,6 +422,8 @@ export interface CursorFile {
    * it, so the on-disk format stays version 1 either way.
    */
   chainClockAt?: number | null;
+  /** Optional network identifier for backup ownership validation. */
+  network?: string;
   targets: Record<string, CursorTarget>;
   /**
    * Bounded history of cursor recovery actions (floor rewinds, operator
@@ -426,6 +437,8 @@ export interface CursorFile {
 interface CursorTarget {
   cursor: string | null;
   lastEventLedger: number | null;
+  /** Optional contract identifier for backup ownership validation. */
+  contractId?: string;
   /**
    * Recently processed event ids, oldest first. Additive and bounded: older
    * cursor files without it load as an empty window, and new files stay small
@@ -438,6 +451,25 @@ interface CursorTarget {
    * malformed value is dropped rather than costing an operator their position.
    */
   rewindFromLedger?: number | null;
+  /**
+   * SHA-256 fingerprint binding this target's cursor to a specific Stellar
+   * network passphrase and contract id. Additive: older cursor files without
+   * it are migrated on startup or via `npm run cursor -- migrate`.
+   */
+  fingerprint?: string;
+}
+
+/**
+ * Compute a deterministic SHA-256 fingerprint binding a persisted cursor target
+ * to its Stellar network passphrase and contract id.
+ */
+export function computeCursorTargetFingerprint(
+  networkPassphrase: string,
+  contractId: string,
+): string {
+  return createHash("sha256")
+    .update(`${networkPassphrase}\0${contractId}`)
+    .digest("hex");
 }
 
 export type CursorTargetEntry = CursorTarget;
@@ -715,6 +747,14 @@ export interface PollerDeps {
   /** Circuit breaker configuration */
   circuitBreakerOptions?: CircuitBreakerOptions;
   /**
+   * Explicit recovery policy for orphaned send-journal entries whose route was
+   * removed or whose network identity changed. When omitted, orphaned entries
+   * are skipped (never silently replayed).
+   */
+  onOrphanedJournalEntry?: (
+    orphan: OrphanedJournalEntry,
+  ) => OrphanDecision | Promise<OrphanDecision>;
+  /**
    * Tuning for the rolling activity baseline. Defaults are production values;
    * tests can shrink the window to observe a comparison quickly.
    */
@@ -910,6 +950,82 @@ export function cursorQuarantinePath(cursorFile: string, at: Date = new Date()):
   return `${cursorFile}.corrupt.${stamp}`;
 }
 
+/**
+ * Read-only preview of where a cursor recovery would move one target.
+ *
+ * Built only from state the poller already holds (the persisted cursor and the
+ * last retained window it observed). It performs no RPC call and no chain
+ * write, so it is safe to show an operator before they act.
+ */
+export interface CursorRecoveryPreview {
+  source: ContractSource;
+  /** Current persisted position, or `null` when none is held. */
+  oldCursorLedger: number | null;
+  /** Ledger the next scan would resume from if recovery ran now. */
+  proposedLedger: number | null;
+  /** Oldest ledger the RPC was last observed to retain. */
+  retainedFloor: number | null;
+  /** Newest ledger the RPC was last observed to hold. */
+  retainedTip: number | null;
+  /** Estimated unrecoverable ledger range `[from, to)`, or `null` when none. */
+  missedRange: { from: number; to: number } | null;
+  verdict: CursorWindowVerdict["status"];
+}
+
+export function previewCursorRecovery(
+  source: ContractSource,
+  cursor: string | null,
+  window: { oldestLedger: number | null; latestLedger: number | null },
+): CursorRecoveryPreview {
+  const verdict = classifyCursorWindow(cursor, window.oldestLedger);
+  const oldCursorLedger =
+    cursor === null ? null : eventCursorLedger(cursor);
+  const retainedFloor = window.oldestLedger;
+  const retainedTip = window.latestLedger;
+
+  if (verdict.status === "stale") {
+    return {
+      source,
+      oldCursorLedger,
+      proposedLedger: retainedFloor,
+      retainedFloor,
+      retainedTip,
+      missedRange: { from: verdict.cursorLedger, to: verdict.cursorLedger + verdict.missedLedgers },
+      verdict: verdict.status,
+    };
+  }
+
+  return {
+    source,
+    oldCursorLedger,
+    proposedLedger: oldCursorLedger,
+    retainedFloor,
+    retainedTip,
+    missedRange: null,
+    verdict: verdict.status,
+  };
+}
+
+/** Human-readable, bounded preview for the cursor CLI. Never prints raw tokens. */
+export function formatCursorRecoveryPreview(preview: CursorRecoveryPreview): string {
+  const fmt = (n: number | null): string => (n === null ? "unknown" : String(n));
+  const lines = [
+    `[cursor-preview] ${preview.source}: ${preview.verdict}`,
+    `  old position:   ledger ${fmt(preview.oldCursorLedger)}`,
+    `  proposed:       ledger ${fmt(preview.proposedLedger)}`,
+    `  retained window: ${fmt(preview.retainedFloor)}..${fmt(preview.retainedTip)}`,
+  ];
+  if (preview.missedRange !== null) {
+    lines.push(
+      `  estimated missed ledger range: ${preview.missedRange.from}..${preview.missedRange.to} (not recoverable)`,
+    );
+  } else {
+    lines.push("  estimated missed ledger range: none");
+  }
+  lines.push("  no changes were made (preview only)");
+  return lines.join("\n");
+}
+
 function isNullOrString(value: unknown): value is string | null {
   return value === null || typeof value === "string";
 }
@@ -936,6 +1052,12 @@ export function isValidCursorFile(value: unknown): value is CursorFile {
     const saved = entry as Record<string, unknown>;
     if (!isNullOrString(saved.cursor)) return false;
     if (!isNullOrNumber(saved.lastEventLedger)) return false;
+    if (
+      saved.fingerprint !== undefined &&
+      (typeof saved.fingerprint !== "string" || saved.fingerprint.length === 0)
+    ) {
+      return false;
+    }
   }
   return true;
 }
@@ -978,6 +1100,9 @@ export function parseCursorFile(raw: string): CursorFile {
       // Transient resume hint: carried through only when it parses.
       ...(parseRewindFromLedger(target.rewindFromLedger) !== null
         ? { rewindFromLedger: parseRewindFromLedger(target.rewindFromLedger) }
+        : {}),
+      ...(typeof target.fingerprint === "string" && target.fingerprint.length > 0
+        ? { fingerprint: target.fingerprint }
         : {}),
     };
   }
@@ -1071,13 +1196,22 @@ function normalizeTargetEntry(value: unknown, label: string): CursorTargetEntry 
   // only when the file had them.
   const recent = value.recentEventIds;
   const rewindFromLedger = parseRewindFromLedger(value.rewindFromLedger);
+  let fingerprint: string | undefined;
+  if (value.fingerprint !== undefined) {
+    if (typeof value.fingerprint !== "string" || value.fingerprint.length === 0) {
+      throw new Error(`${label}: fingerprint must be a non-empty string`);
+    }
+    fingerprint = value.fingerprint;
+  }
   return {
     cursor,
     lastEventLedger,
+    ...(contractId !== undefined ? { contractId } : {}),
     ...(Array.isArray(recent)
       ? { recentEventIds: recent.filter((id): id is string => typeof id === "string") }
       : {}),
     ...(rewindFromLedger !== null ? { rewindFromLedger } : {}),
+    ...(fingerprint !== undefined ? { fingerprint } : {}),
   };
 }
 
@@ -1182,6 +1316,51 @@ export function parseAndMigrateCursorFile(
   throw new Error("cursor file: unrecognised shape (expected versioned targets map)");
 }
 
+/** Compute a stable SHA-256 hex digest of raw cursor file contents for CAS checks. */
+export function cursorDigest(raw: string): string {
+  return createHash("sha256").update(raw, "utf8").digest("hex");
+}
+
+export type CursorCasResult =
+  | { ok: true; digest: string | null }
+  | {
+      ok: false;
+      conflict: true;
+      expected: string | null;
+      actual: string | null;
+      reason: string;
+    };
+
+/**
+ * Compare-and-swap check for a cursor file against an expected SHA-256 digest
+ * (or `null` when the file is expected to be absent). When `expectedDigest` is
+ * `undefined`, no CAS precondition was requested and the check succeeds.
+ */
+export function checkCursorCas(
+  currentRaw: string | null,
+  expectedDigest: string | null | undefined,
+): CursorCasResult {
+  const actual = currentRaw === null ? null : cursorDigest(currentRaw);
+  if (expectedDigest === undefined) {
+    return { ok: true, digest: actual };
+  }
+  if (actual !== expectedDigest) {
+    return {
+      ok: false,
+      conflict: true,
+      expected: expectedDigest,
+      actual,
+      reason:
+        expectedDigest === null
+          ? "file exists on disk (expected absent)"
+          : actual === null
+            ? "file is missing on disk (expected existing content)"
+            : `digest mismatch (expected ${expectedDigest.slice(0, 12)}…, got ${actual.slice(0, 12)}…)`,
+    };
+  }
+  return { ok: true, digest: actual };
+}
+
 /** Build the on-disk payload the poller always writes. */
 export function buildCursorFile(
   targets: Iterable<{
@@ -1190,6 +1369,7 @@ export function buildCursorFile(
     lastEventLedger: number | null;
     recentEventIds?: string[];
     rewindFromLedger?: number | null;
+    fingerprint?: string;
   }>,
   updatedAt: string,
   chainClockAt?: number | null,
@@ -1213,6 +1393,7 @@ export function buildCursorFile(
           ...(typeof t.rewindFromLedger === "number"
             ? { rewindFromLedger: t.rewindFromLedger }
             : {}),
+          ...(t.fingerprint !== undefined ? { fingerprint: t.fingerprint } : {}),
         } satisfies CursorTarget,
       ]),
     ),
@@ -1469,8 +1650,8 @@ async function sendWithRetry(
     } catch (err) {
       attempt++;
       const retryAfterMs = extractRetryAfterMs(err);
-      if (attempt >= maxRetries || !shouldRetry()) {
-        throw err; // Exhausted retries, or a shutdown made waiting pointless
+      if (attempt >= maxRetries || !shouldRetry() || isForumTopicClosed(err)) {
+        throw err; // Exhausted retries, shutdown in progress, or a permanent route failure
       }
 
       const delay = retryAfterMs !== null ? retryAfterMs : backoff;
@@ -1610,6 +1791,7 @@ export function createPoller(deps: PollerDeps) {
         source: t.source,
         contractId: t.contractId,
         version: normalizeContractVersion(t.version),
+        supportedVersion: isContractVersionSupported(t.source, t.version),
         lastCycleMs: 0,
         maxCycleMs: 0,
         cursor: null,
@@ -1669,6 +1851,7 @@ export function createPoller(deps: PollerDeps) {
     sendJournal = createSendJournal({
       filePath: config.sendJournalFile,
       now,
+      secrets: config.botToken ? [config.botToken] : [],
     });
   }
 
@@ -1731,6 +1914,12 @@ export function createPoller(deps: PollerDeps) {
     pendingFlush: false,
     lastFlushAt: null,
     suppressedLogs: 0,
+    unsupportedVersions: validateDecoderCombinations(targets).map((f) => ({
+      source: f.source,
+      version: f.version ?? "",
+      fallback: f.fallbackVersion,
+      reason: f.reason,
+    })),
     targets: [],
     sbomDigest: null,
     circuitBreaker: {
@@ -1938,10 +2127,44 @@ export function createPoller(deps: PollerDeps) {
     try {
       const result = parseAndMigrateCursorFile(raw, { now: () => new Date(now()) });
       const parsed = result.file;
+      let fingerprintMigrated = false;
       for (const [source, saved] of Object.entries(parsed.targets)) {
         const key = source as ContractSource;
         const target = state.get(key);
         if (!target) continue;
+        const expectedFingerprint = computeCursorTargetFingerprint(
+          config.networkPassphrase,
+          target.contractId,
+        );
+        if (saved.fingerprint !== undefined && saved.fingerprint !== expectedFingerprint) {
+          // Network or contract configuration changed: never silently reuse an
+          // incompatible cursor. Reset this target to cold start and rewrite
+          // the new fingerprint before the first poll cycle.
+          target.cursor = null;
+          target.lastEventLedger = null;
+          target.rewindFromLedger = null;
+          target.cursorStale = false;
+          dedup.set(key, new EventDedupWindow(config.dedupWindow));
+          fingerprintMigrated = true;
+          Logger.warn(
+            "poller",
+            `[poller] cursor target ${key} fingerprint mismatch ` +
+              `(persisted ${saved.fingerprint.slice(0, 12)} != expected ${expectedFingerprint.slice(0, 12)}); ` +
+              `ignoring incompatible cursor and starting cold (run 'npm run cursor -- migrate' for explicit migration)`,
+            {
+              action: "cursor_fingerprint_mismatch",
+              source: key,
+              contractId: target.contractId,
+              expectedFingerprint,
+              persistedFingerprint: saved.fingerprint,
+              cursorFile: config.cursorFile,
+            },
+          );
+          continue;
+        }
+        if (saved.fingerprint === undefined) {
+          fingerprintMigrated = true;
+        }
         target.cursor = saved.cursor ?? null;
         target.lastEventLedger = saved.lastEventLedger ?? null;
         // A rewind that was still pending when the process stopped resumes from
@@ -1953,15 +2176,24 @@ export function createPoller(deps: PollerDeps) {
         dedup.set(key, EventDedupWindow.fromJSON(saved.recentEventIds, config.dedupWindow));
       }
       // Memory now equals the file; nothing is waiting to be flushed — unless
-      // the file was a legacy shape, which start() rewrites before any cycle.
+      // the file was a legacy shape or missing target fingerprints, which
+      // start() rewrites before any cycle.
       status.pendingFlush = false;
-      if (result.migrated) {
+      if (result.migrated || fingerprintMigrated) {
         pendingRewrite = true;
         markDirty();
-        console.log(
-          `[poller] migrated cursor file from ${result.source} → ` +
-            `schema v${CURSOR_SCHEMA_VERSION} at ${config.cursorFile}`,
-        );
+        if (result.migrated) {
+          console.log(
+            `[poller] migrated cursor file from ${result.source} → ` +
+              `schema v${CURSOR_SCHEMA_VERSION} at ${config.cursorFile}`,
+          );
+        } else {
+          Logger.info(
+            "poller",
+            `[poller] bound cursor target fingerprints at ${config.cursorFile}`,
+            { action: "cursor_fingerprint_migrated", cursorFile: config.cursorFile },
+          );
+        }
       }
       // Resume the chain clock alongside the cursors. Without this a restart
       // between two quiet scans would report `unknown` until the next event
@@ -2023,6 +2255,7 @@ export function createPoller(deps: PollerDeps) {
         lastEventLedger: t.lastEventLedger,
         recentEventIds: dedup.get(t.source)?.toJSON() ?? [],
         rewindFromLedger: t.rewindFromLedger,
+        fingerprint: computeCursorTargetFingerprint(config.networkPassphrase, t.contractId),
       })),
       new Date(now()).toISOString(),
       status.chainClockAt,
@@ -2407,6 +2640,8 @@ export function createPoller(deps: PollerDeps) {
             ledger: event.ledger,
             eventName: event.payload.name,
             textHash,
+            chatId: resolveRouteChatId(config, event.source),
+            networkPassphrase: config.networkPassphrase,
             at: now(),
           });
         } catch (err) {
@@ -2448,6 +2683,22 @@ export function createPoller(deps: PollerDeps) {
         // All retries exhausted. The event still counts as failed and the cursor
         // still advances — but the message is parked instead of dropped, so a
         // transient Telegram outage costs a delay rather than the notification.
+        if (sendJournal) {
+          try {
+            await sendJournal.recordError({
+              id: event.eventId,
+              source: event.source,
+              ledger: event.ledger,
+              eventName: event.payload.name,
+              error: err,
+              secrets: config.botToken ? [config.botToken] : [],
+            });
+          } catch (journalErr) {
+            console.error(
+              `[poller] send journal error record failed for ${event.eventId}: ${safeErrorMessage(journalErr)}`,
+            );
+          }
+        }
         recordFailedIncrement();
         metrics?.notificationsFailed.inc();
         failed += 1;
@@ -2465,7 +2716,18 @@ export function createPoller(deps: PollerDeps) {
             `${chat ? ` to chat ${chat}` : ""} after retries: ` +
             `${errorMessage(err)} correlation=${correlationId}`,
         );
-        if (deadLetterEnabled) {
+        if (isForumTopicClosed(err)) {
+          // Permanent route failure: the topic is closed or deleted. Retrying
+          // will produce the same 400, so the message is not parked in the DLQ.
+          // The cursor still advances and the failure is counted above. The
+          // operator must re-open the topic (or update the route) to restore
+          // delivery; unrelated topic routes remain operational.
+          console.error(
+            `[poller] permanent route failure for ${event.payload.name} at ledger ${event.ledger}` +
+              `${chat ? ` to chat ${chat}` : ""}: forum topic is closed or not found — ` +
+              `not queuing for retry (update the route to restore delivery)`,
+          );
+        } else if (deadLetterEnabled) {
           await deadLetter.enqueue({
             source: event.source,
             ledger: event.ledger,
@@ -3249,8 +3511,37 @@ export function createPoller(deps: PollerDeps) {
       // the cursor commit. Treat them as committed so a restart never duplicates
       // them (the existing lossy cursor-commit policy).
       if (sendJournal) {
-        for (const entry of await sendJournal.loadPending()) {
+        const recoveryContext = {
+          resolveRouteChatId: (s: string) =>
+            resolveRouteChatId(config, s === "market" || s === "squad" ? s : undefined),
+          networkPassphrase: config.networkPassphrase,
+        };
+        const { valid, orphaned } = await sendJournal.classifyPending(recoveryContext);
+        for (const entry of valid) {
           maybeSent.add(entry.id);
+        }
+        if (orphaned.length > 0) {
+          if (deps.onOrphanedJournalEntry) {
+            const recovered = await sendJournal.recoverOrphans(
+              recoveryContext,
+              deps.onOrphanedJournalEntry,
+            );
+            for (const entry of recovered.reroutedEntries) {
+              maybeSent.add(entry.id);
+            }
+            Logger.warn(
+              "poller",
+              `recovered ${orphaned.length} orphaned send-journal entries ` +
+                `(discarded=${recovered.discarded}, rerouted=${recovered.rerouted})`,
+            );
+          } else {
+            Logger.warn(
+              "poller",
+              `skipped ${orphaned.length} orphaned send-journal entr${orphaned.length === 1 ? "y" : "ies"} ` +
+                `(requires explicit discard or reroute decision): ` +
+                orphaned.map((o) => `${o.entry.id}:${o.reason}`).join(", "),
+            );
+          }
         }
         await sendJournal.compact();
       }
@@ -3280,6 +3571,24 @@ export function createPoller(deps: PollerDeps) {
           pollIntervalMs: config.pollIntervalMs,
         },
       );
+      // Flag unsupported contract version combinations before live polling begins.
+      const unsupported = validateDecoderCombinations(targets);
+      for (const flag of unsupported) {
+        Logger.warn(
+          "poller",
+          `[poller] unsupported contract version combination: source=${flag.source} version=${flag.version} fallback=${flag.fallbackVersion}; ${flag.reason}`,
+          {
+            action: "unsupported_contract_version",
+            source: flag.source,
+            version: flag.version,
+            normalizedVersion: flag.normalizedVersion,
+            contractId: flag.contractId,
+            fallbackVersion: flag.fallbackVersion,
+            reason: flag.reason,
+          },
+        );
+      }
+
       await persistStatus();
       await flushAudit();
       void loop();
@@ -3456,6 +3765,11 @@ export function createPoller(deps: PollerDeps) {
     /** Persist buffered audit entries now (used on shutdown). */
     flushAuditFile(): Promise<void> {
       return flushAudit();
+    },
+
+    /** Return decoder capability reports for each configured watch target. */
+    capabilities(): DecoderCapabilityReport[] {
+      return targets.map((t) => getDecoderCapabilityReport(t.source, t.version, t.contractId));
     },
 
     /** Run one polling cycle directly and await its completion. */
